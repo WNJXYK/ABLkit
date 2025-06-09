@@ -31,7 +31,7 @@ def get_dataset(train=True, get_pseudo_label=False):
 
     if not os.path.exists(data_dir):
         print("Dataset not exist, downloading it...")
-        url = "https://drive.google.com/u/0/uc?id=1G07kw-wK-rqbg_85tuB7FNfA49q8lvoy&export=download"
+        url = "https://drive.google.com/u/0/uc?id=1t52OE2Wdm5GdShX1jD2Wy8phCllk0r8I&export=download"
         download_and_unzip(url, os.path.join(CURRENT_DIR, "HWF.zip"))
         print("Download and extraction complete.")
 
