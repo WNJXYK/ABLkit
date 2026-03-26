@@ -294,6 +294,9 @@ class SimpleBridge(BaseBridge):
                 self.idx_to_pseudo_label(sub_data_examples)
                 self.abduce_pseudo_label(sub_data_examples)
                 self.filter_pseudo_label(sub_data_examples)
+                if len(sub_data_examples) == 0:
+                    print_log("Warning: all samples filtered out in this segment, skipping training.", logger="current")
+                    continue
                 self.concat_data_examples(sub_data_examples, label_data_examples)
                 self.pseudo_label_to_idx(sub_data_examples)
                 self.model.train(sub_data_examples)
