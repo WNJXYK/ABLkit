@@ -420,32 +420,3 @@ def precompute_transitions(decomp, K, y, var_domains=None):
     return None  # kept for import compatibility
 
 
-def decomposition_from_kb(
-    logic_forward: Callable,
-    n: int,
-    K: int,
-    var_groups: List[List[int]],
-    css_fn: Callable,
-    H: int,
-    h_init: int = 0,
-) -> Decomposition:
-    """
-    Build a chain Decomposition from a KB's logic_forward + CSS function.
-
-    The css_fn signature:
-        css_fn(h_prev, z_vals, step, y) -> h_next | None
-        css_fn(None, None, L, y) -> required final state
-    """
-    L = len(var_groups)
-
-    def chain_transition(h_prev, z_vals, step_l, y):
-        return css_fn(h_prev, z_vals, step_l, y)
-
-    def h_final_fn(y):
-        return css_fn(None, None, L, y)
-
-    return make_chain(
-        L=L, var_groups=var_groups,
-        transition_fn=chain_transition,
-        h_init=h_init, h_final_fn=h_final_fn, n=n, H=H,
-    )

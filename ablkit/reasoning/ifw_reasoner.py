@@ -117,34 +117,54 @@ class IFWReasoner(Reasoner):
     def __init__(
         self,
         kb: KBBase,
-        decomp: Optional[Decomposition] = None,
         K: Optional[int] = None,
-        decomp_fn: Optional[Callable] = None,
         idx_to_label: Optional[dict] = None,
         max_states: int = 0,
         perception_top_k: int = 0,
         perception_threshold: float = 0.0,
+        auto_decompose: bool = True,
+        auto_decompose_n: Optional[int] = None,
         **kwargs,
     ):
         super().__init__(kb, dist_func="confidence", idx_to_label=idx_to_label, **kwargs)
-        self.decomp = decomp
-        self.decomp_fn = decomp_fn
         self.K = K if K is not None else len(kb.pseudo_label_list)
         self.max_states = max_states
         self.perception_top_k = perception_top_k
         self.perception_threshold = perception_threshold
         self._n_abduce = 0
         self._n_valid = 0
+        self._decomp_cache = {}
 
-        if decomp is None and decomp_fn is None:
-            raise ValueError("Either decomp or decomp_fn must be provided")
+        if auto_decompose_n is not None:
+            # Fixed n: discover once at init
+            self._decomp_cache[auto_decompose_n] = self._discover(auto_decompose_n)
+
+    def _discover(self, n: int) -> Decomposition:
+        """Auto-discover decomposition for n variables (cached)."""
+        if n in self._decomp_cache:
+            return self._decomp_cache[n]
+        from .tracer import discover_decomposition
+        from ..utils import print_log
+        decomp, info = discover_decomposition(
+            self.kb.logic_forward, n=n, K=self.K, num_samples=500,
+        )
+        if isinstance(info, dict):
+            cuts = info.get("chain_cuts", [])
+            top_c = f"{cuts[0]['compression']:.0f}x" if cuts else "N/A"
+            print_log(
+                f"[{self.__class__.__name__}] Auto-decomposed n={n}: "
+                f"{len(info.get('var_groups', []))} steps, "
+                f"CSS domains={info.get('css_domain_sizes', [])}, "
+                f"top compression={top_c}",
+                logger="current",
+            )
+        else:
+            print_log(f"[{self.__class__.__name__}] Auto-decomposed n={n} (fallback)", logger="current")
+        self._decomp_cache[n] = decomp
+        return decomp
 
     def _get_decomp(self, n: int) -> Decomposition:
-        if self.decomp is not None and self.decomp.n == n:
-            return self.decomp
-        if self.decomp_fn is not None:
-            return self.decomp_fn(n)
-        return self.decomp
+        return self._discover(n)
 
     def abduce(self, data_example: ListData) -> List[Any]:
         pred_prob = _normalize_pred_prob(data_example.pred_prob, self.K)
@@ -224,37 +244,55 @@ class IFWA3BLReasoner(Reasoner):
     def __init__(
         self,
         kb: KBBase,
-        decomp: Optional[Decomposition] = None,
         K: Optional[int] = None,
         temperature: float = 1.0,
-        decomp_fn: Optional[Callable] = None,
         idx_to_label: Optional[dict] = None,
         max_states: int = 0,
         perception_top_k: int = 0,
         perception_threshold: float = 0.0,
+        auto_decompose_n: Optional[int] = None,
         **kwargs,
     ):
         super().__init__(kb, dist_func="confidence", idx_to_label=idx_to_label, **kwargs)
-        self.decomp = decomp
-        self.decomp_fn = decomp_fn
         self.K = K if K is not None else len(kb.pseudo_label_list)
         self.class_num = self.K
         self.temperature = temperature
         self.max_states = max_states
         self.perception_top_k = perception_top_k
         self.perception_threshold = perception_threshold
+        self._decomp_cache = {}
         self._n_abduce = 0
         self._n_valid = 0
 
-        if decomp is None and decomp_fn is None:
-            raise ValueError("Either decomp or decomp_fn must be provided")
+        if auto_decompose_n is not None:
+            self._decomp_cache[auto_decompose_n] = self._discover(auto_decompose_n)
+
+    def _discover(self, n: int) -> Decomposition:
+        """Auto-discover decomposition for n variables (cached)."""
+        if n in self._decomp_cache:
+            return self._decomp_cache[n]
+        from .tracer import discover_decomposition
+        from ..utils import print_log
+        decomp, info = discover_decomposition(
+            self.kb.logic_forward, n=n, K=self.K, num_samples=500,
+        )
+        if isinstance(info, dict):
+            cuts = info.get("chain_cuts", [])
+            top_c = f"{cuts[0]['compression']:.0f}x" if cuts else "N/A"
+            print_log(
+                f"[{self.__class__.__name__}] Auto-decomposed n={n}: "
+                f"{len(info.get('var_groups', []))} steps, "
+                f"CSS domains={info.get('css_domain_sizes', [])}, "
+                f"top compression={top_c}",
+                logger="current",
+            )
+        else:
+            print_log(f"[{self.__class__.__name__}] Auto-decomposed n={n} (fallback)", logger="current")
+        self._decomp_cache[n] = decomp
+        return decomp
 
     def _get_decomp(self, n: int) -> Decomposition:
-        if self.decomp is not None and self.decomp.n == n:
-            return self.decomp
-        if self.decomp_fn is not None:
-            return self.decomp_fn(n)
-        return self.decomp
+        return self._discover(n)
 
     def abduce(self, data_example: ListData) -> Tuple[List[Any], List[Any]]:
         pred_prob = _normalize_pred_prob(data_example.pred_prob, self.K)
