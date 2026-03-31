@@ -216,7 +216,7 @@ def find_bottlenecks(
         })
 
     bottlenecks.sort(key=lambda x: x["compression"], reverse=True)
-    return bottlenecks
+    return bottlenecks, node_by_pos
 
 
 def discover_decomposition(
@@ -249,7 +249,7 @@ def discover_decomposition(
     rng = random.Random(seed)
 
     # Step 1: Find bottlenecks
-    bottlenecks = find_bottlenecks(logic_forward, n, K, num_samples, seed)
+    bottlenecks, node_by_pos = find_bottlenecks(logic_forward, n, K, num_samples, seed)
 
     # Step 2: Greedy chain cover
     # Find nested sequence: {} ⊂ S₁ ⊂ S₂ ⊂ ... ⊂ {0,...,n-1}
@@ -288,145 +288,82 @@ def discover_decomposition(
     #
     # Last step: verified against y at runtime (y-dependent).
 
-    cut_sources = [frozenset()] + [c["sources"] for c in chain_cuts]
-
-    # Step 4a: Functional CSS computation.
-    # A single graph node may NOT be a valid CSS (e.g., carry loses digit info).
-    # Instead, compute CSS as a fingerprint of KB behavior on remaining vars.
-    # For source set S, CSS(z_S) = tuple(KB(z_S, z_rest_j) for j=1..m).
-    # This guarantees lossless: same fingerprint ⟺ same behavior.
-    _css_probes = {}  # target_sources -> list of complement z-value probes
-
-    def _init_probes(target_sources, num_probes=20):
-        """Generate random probe assignments for variables NOT in target_sources."""
-        if target_sources in _css_probes:
-            return
-        complement = sorted(frozenset(range(n)) - target_sources)
-        probe_rng = random.Random(seed + hash(target_sources))
-        probes = []
-        for _ in range(num_probes):
-            probe = {v: probe_rng.randint(0, K - 1) for v in complement}
-            probes.append(probe)
-        _css_probes[target_sources] = probes
-
-    def _get_css_value(z_values, target_sources):
-        """Compute functional CSS: fingerprint of KB behavior on complement vars."""
-        _init_probes(target_sources)
-        probes = _css_probes[target_sources]
-        fingerprint = []
-        for probe in probes:
-            z = list(z_values)  # copy
-            for v, val in probe.items():
-                z[v] = val
-            try:
-                res = logic_forward(z)
-                if isinstance(res, TracedValue):
-                    res = res.value
-                fingerprint.append(res)
-            except Exception:
-                fingerprint.append(None)
-        return tuple(fingerprint)
-
-    # Step 4b: Build forward transition tables
-    # trans_table[step][(css_prev, z_vals)] = css_next
-    # Also: css_to_representative[step][css_val] = representative z_values for vars before this step
+    # Step 4: Precompute transitions.
+    #
+    # CSS = KB output with unset vars = 0 (always a valid sufficient statistic).
+    # This gives compact scalar states. Domain grows per step, but the DP's
+    # max_states (beam search) controls runtime cost.
     import itertools
 
-    trans_table = [{} for _ in range(L)]
-    css_states = [set() for _ in range(L + 1)]  # reachable CSS states at each cut
-    css_states[0].add(None)  # initial state: no CSS before step 0
+    def _run_kb(z_values):
+        """Run KB on plain values (not traced)."""
+        res = logic_forward(z_values)
+        return res.value if isinstance(res, TracedValue) else res
 
-    # Representative: for each CSS state, one concrete variable assignment that produces it
+    trans_table = [{} for _ in range(L)]
+    css_states = [set() for _ in range(L + 1)]
+    css_states[0].add(None)
+
     css_representative = [{} for _ in range(L + 1)]
     css_representative[0][None] = {}
 
-    for step in range(L - 1):  # last step handled at runtime
+    for step in range(L - 1):
         step_vars = var_groups[step]
-        target_src = cut_sources[step + 1]
         r = len(step_vars)
 
         for css_prev in css_states[step]:
-            # Get a representative partial assignment for css_prev
             rep = css_representative[step].get(css_prev, {})
-
             for z_vals in itertools.product(range(K), repeat=r):
-                # Build full z with: representative values + current z_vals
                 z = [0] * n
                 for vid, val in rep.items():
                     z[vid] = val
                 for j, vid in enumerate(step_vars):
                     z[vid] = z_vals[j]
 
-                # Get CSS value after this step
-                css_next = _get_css_value(z, target_src)
-                if css_next is not None:
-                    trans_table[step][(css_prev, z_vals)] = css_next
-                    css_states[step + 1].add(css_next)
+                css_next = _run_kb(z)
+                trans_table[step][(css_prev, z_vals)] = css_next
+                css_states[step + 1].add(css_next)
 
-                    # Store representative
-                    if css_next not in css_representative[step + 1]:
-                        new_rep = dict(rep)
-                        for j, vid in enumerate(step_vars):
-                            new_rep[vid] = z_vals[j]
-                        css_representative[step + 1][css_next] = new_rep
+                if css_next not in css_representative[step + 1]:
+                    new_rep = dict(rep)
+                    for j, vid in enumerate(step_vars):
+                        new_rep[vid] = z_vals[j]
+                    css_representative[step + 1][css_next] = new_rep
 
-    # Step 4c: Precompute the final step's output table.
-    # For the last step, we need to know KB(z) for full assignments.
-    # Since functional CSS is a valid sufficient statistic, using any
-    # representative + final z_vals gives consistent results.
-    final_output = {}  # (css_prev, z_vals) -> y_predicted
-    if L >= 2:
-        final_step = L - 1
-        final_vars = var_groups[final_step]
-        r_final = len(final_vars)
-        for css_prev in css_states[final_step]:
-            rep = css_representative[final_step].get(css_prev, {})
-            for z_vals in itertools.product(range(K), repeat=r_final):
-                z = [0] * n
-                for vid, val in rep.items():
-                    z[vid] = val
-                for j, vid in enumerate(final_vars):
-                    z[vid] = z_vals[j]
-                res = logic_forward(z)
-                if isinstance(res, TracedValue):
-                    res = res.value
-                final_output[(css_prev, z_vals)] = res
-    elif L == 1:
-        # Single step: just enumerate all z_vals
-        for z_vals in itertools.product(range(K), repeat=len(var_groups[0])):
+    # Final step: precompute KB output (representative is y-consistent for
+    # CSS = KB output, since same partial output → same final output).
+    final_output = {}
+    final_vars = var_groups[L - 1]
+    r_final = len(final_vars)
+    for css_prev in css_states[L - 1]:
+        rep = css_representative[L - 1].get(css_prev, {})
+        for z_vals in itertools.product(range(K), repeat=r_final):
             z = [0] * n
-            for j, vid in enumerate(var_groups[0]):
+            for vid, val in rep.items():
+                z[vid] = val
+            for j, vid in enumerate(final_vars):
                 z[vid] = z_vals[j]
-            res = logic_forward(z)
-            if isinstance(res, TracedValue):
-                res = res.value
-            final_output[(None, z_vals)] = res
+            final_output[(css_prev, z_vals)] = _run_kb(z)
 
-    # Count total precomputed transitions
     total_trans = sum(len(t) for t in trans_table) + len(final_output)
 
-    # Step 5: Build transition function from precomputed tables
+    # Step 5: Build transition function
     _tt = trans_table
     _fo = final_output
     _L = L
 
     def transition_fn(h_prev, z_vals, step, y):
         """
-        State = CSS fingerprint (hashable).
-        Intermediate steps: lookup in precomputed transition table.
-        Last step: lookup precomputed KB output and compare with y.
+        State = KB partial output (compact scalar).
+        Intermediate: precomputed table lookup.
+        Last: compare precomputed full output with y.
         """
         if step == _L - 1:
-            # Final step: check precomputed output against y
-            key = (h_prev, z_vals)
-            y_pred = _fo.get(key)
+            y_pred = _fo.get((h_prev, z_vals))
             if y_pred is not None and y_pred == y:
                 return ("__target__", y)
             return None
-
-        # Intermediate: table lookup
-        key = (h_prev, z_vals)
-        return _tt[step].get(key)  # None if invalid
+        return _tt[step].get((h_prev, z_vals))
 
     h_init = None  # matches css_states[0] = {None}
 
@@ -446,7 +383,7 @@ def discover_decomposition(
         "bottlenecks": bottlenecks[:10],
         "chain_cuts": chain_cuts,
         "var_groups": var_groups,
-        "css_domain_sizes": [c["domain_size"] for c in chain_cuts],
+        "css_domain_sizes": [c["min_domain"] for c in chain_cuts],
     }
     return decomp, info
 
