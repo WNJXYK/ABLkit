@@ -2,7 +2,13 @@
 Automatic CSS Discovery via Operator Overloading + Functional Fingerprinting.
 
 Traces a KB's logic_forward execution to discover information bottlenecks,
-then builds an IFW Decomposition with precomputed transition tables.
+then builds an IFW Decomposition (tree or chain) with precomputed transition
+tables.
+
+Tree decomposition is preferred when the KB has independent sub-constraints
+(e.g., f(z) = g(z[0:3]) + h(z[3:6])), allowing parallel sub-problem solving.
+Chain decomposition is used when dependencies are sequential (e.g., addition
+carry propagation). The algorithm automatically selects the cheaper option.
 
 CSS correctness is guaranteed by functional fingerprinting: for each source
 set S, CSS(z_S) = tuple(KB(z_S, z_rest_j) for j=1..m) using random probes.
@@ -25,15 +31,16 @@ Usage:
     for b in bottlenecks[:5]:
         print(f"sources={b['sources']} domain={b['domain_size']} compression={b['compression']:.0f}x")
 
-    # Step 2: Build decomposition (one-time precomputation)
+    # Step 2: Build decomposition (auto-selects tree or chain)
     decomp, info = discover_decomposition(kb.logic_forward, n=4, K=10)
+    print(info["decomposition_type"])  # "tree" or "chain"
 """
 
 import random
 from collections import defaultdict
 from typing import Callable, List, Optional, Tuple, Any, FrozenSet
 
-from .ifw_dp import Decomposition, make_chain
+from .ifw_dp import Decomposition, make_chain, make_tree
 
 
 # ============================================================
@@ -134,7 +141,10 @@ def find_bottlenecks(
     K: int,
     num_samples: int = 500,
     seed: int = 0,
-) -> list:
+    constraint_fn: Optional[Callable] = None,
+    y_size: int = 0,
+    Y_domains: Optional[List[int]] = None,
+) -> tuple:
     """
     Discover information bottlenecks in KB's logic_forward.
 
@@ -188,8 +198,7 @@ def find_bottlenecks(
 
     for pos, entry in sorted(node_by_pos.items()):
         src = entry["sources"]
-        if src is None:
-            continue
+        if src is None: continue
         vals = entry["values"]
         # CSS: use first-seen position (guaranteed lossless)
         if src not in css_values and pos == first_pos_for_src.get(src):
@@ -216,7 +225,78 @@ def find_bottlenecks(
         })
 
     bottlenecks.sort(key=lambda x: x["compression"], reverse=True)
-    return bottlenecks, node_by_pos
+
+    y_check_info = {}
+    if constraint_fn is not None and y_size > 0:
+        y_check_info = _discover_y_checks(
+            constraint_fn, n, K, y_size, Y_domains, num_samples, seed,
+        )
+
+    return bottlenecks, node_by_pos, y_check_info
+
+
+def _discover_y_checks(
+    constraint_fn: Callable,
+    n: int,
+    K: int,
+    y_size: int,
+    Y_domains: Optional[List[int]],
+    num_samples: int,
+    seed: int,
+) -> dict:
+    """
+    Trace constraint_fn(z, y_parts) to discover y-check structure.
+
+    For each y-part index j (0..y_size-1), finds the minimal z-source set
+    required before y_parts[j] can be checked.
+
+    Returns:
+        {y_part_index: frozenset of z-variable indices}
+    """
+    rng = random.Random(seed)
+    if Y_domains is None:
+        Y_domains = [K] * y_size
+
+    y_z_sources = {}  # y_part_index -> frozenset of z indices
+
+    for _ in range(num_samples):
+        z_vals = [rng.randint(0, K - 1) for _ in range(n)]
+        y_vals = [rng.randint(0, Y_domains[j] - 1) for j in range(y_size)]
+
+        graph = []
+        z_traced = [TracedValue(z_vals[i], frozenset({i}), graph) for i in range(n)]
+        y_traced = [TracedValue(y_vals[j], frozenset({n + j}), graph) for j in range(y_size)]
+
+        try:
+            constraint_fn(z_traced, y_traced)
+        except Exception:
+            continue
+
+        # For this sample, find first computation node where each y-index
+        # appears alongside z-indices (skip pure y-input nodes)
+        sample_y_z_src = {}
+        for node in graph:
+            y_in_node = {s - n for s in node.sources if s >= n}
+            z_in_node = frozenset(s for s in node.sources if s < n)
+            if not z_in_node:
+                continue  # skip pure-y nodes (y inputs themselves)
+            for yi in y_in_node:
+                if yi not in sample_y_z_src:
+                    sample_y_z_src[yi] = z_in_node
+
+        # Union of z-sources across samples (handles branching code paths)
+        for yi, z_src in sample_y_z_src.items():
+            if yi not in y_z_sources:
+                y_z_sources[yi] = z_src
+            else:
+                y_z_sources[yi] = y_z_sources[yi] | z_src
+
+    if y_z_sources:
+        print(f"  [Tracer] y-check discovery (y_size={y_size}):")
+        for yi in sorted(y_z_sources):
+            print(f"    y[{yi}] depends on z-sources {sorted(y_z_sources[yi])}")
+
+    return y_z_sources
 
 
 def discover_decomposition(
@@ -226,15 +306,24 @@ def discover_decomposition(
     num_samples: int = 500,
     seed: int = 0,
     min_compression: float = 1.5,
+    max_precompute: int = 100_000,
+    constraint_fn: Optional[Callable] = None,
+    y_size: int = 0,
+    Y_domains: Optional[List[int]] = None,
+    y_decompose_fn: Optional[Callable] = None,
 ) -> Tuple[Decomposition, list]:
     """
-    Automatically discover an IFW chain decomposition from KB code.
+    Automatically discover an IFW decomposition (tree or chain) from KB code.
+
+    Tries tree decomposition first (exploits parallel sub-constraints),
+    falls back to chain if no branching structure is found or chain is cheaper.
 
     Steps:
       1. Trace execution to find bottleneck nodes
-      2. Select a chain of nested source sets (greedy cover)
-      3. Build CSS lookup tables from traced executions
-      4. Return Decomposition + bottleneck info
+      2. Try tree decomposition via greedy Hasse construction
+      3. Try chain decomposition via greedy nested cover
+      4. Compare estimated costs, pick the cheaper one
+      5. Build CSS lookup tables (with budget limit + on-the-fly fallback)
 
     Args:
         logic_forward: KB's forward function (must use supported ops).
@@ -242,6 +331,8 @@ def discover_decomposition(
         K: Domain size.
         num_samples: Sampling budget.
         min_compression: Minimum compression ratio for a useful bottleneck.
+        max_precompute: Max KB calls for precomputation. Beyond this,
+            transitions are computed on-the-fly during DP and cached.
 
     Returns:
         (Decomposition, bottleneck_info)
@@ -249,11 +340,16 @@ def discover_decomposition(
     rng = random.Random(seed)
 
     # Step 1: Find bottlenecks
-    bottlenecks, node_by_pos = find_bottlenecks(logic_forward, n, K, num_samples, seed)
+    bottlenecks, node_by_pos, y_check_info = find_bottlenecks(
+        logic_forward, n, K, num_samples, seed,
+        constraint_fn=constraint_fn, y_size=y_size, Y_domains=Y_domains,
+    )
 
-    # Step 2: Greedy chain cover
-    # Find nested sequence: {} ⊂ S₁ ⊂ S₂ ⊂ ... ⊂ {0,...,n-1}
-    chain_cuts = []  # list of (sources, domain_size)
+    # Step 2: Try tree decomposition
+    tree_result = _build_hasse_tree(bottlenecks, n, min_compression)
+
+    # Step 3: Greedy chain cover
+    chain_cuts = []
     covered = frozenset()
     for b in sorted(bottlenecks, key=lambda x: (x["coverage"], -x["compression"])):
         if b["sources"] > covered and b["compression"] >= min_compression:
@@ -261,11 +357,82 @@ def discover_decomposition(
                 chain_cuts.append(b)
                 covered = b["sources"]
 
-    if not chain_cuts:
-        # No good bottlenecks → fallback to one-var-per-step chain
-        return _build_brute_chain(logic_forward, n, K), bottlenecks
+    # Step 4: Estimate all costs and choose the best decomposition
+    brute_cost = _estimate_brute_cost(n, K)
+    chain_cost = _estimate_chain_cost(chain_cuts, n, K)
+    tree_cost = None
+    use_tree = False
+    tree_var_groups = tree_children = tree_root = None
 
-    # Step 3: Derive var_groups from chain cuts
+    if tree_result is not None:
+        tree_var_groups, tree_children, tree_root = tree_result
+
+        # Estimate tree cost using bottleneck domain sizes
+        bn_domain = {b["sources"]: b["domain_size"] for b in bottlenecks}
+        tree_nodes_sources = []
+        for i in range(len(tree_var_groups)):
+            src = frozenset()
+            stack = [i]
+            while stack:
+                nd = stack.pop()
+                src |= frozenset(tree_var_groups[nd])
+                stack.extend(tree_children[nd])
+            tree_nodes_sources.append(src)
+
+        css_domain_est = {}
+        for i, src in enumerate(tree_nodes_sources):
+            css_domain_est[i] = bn_domain.get(src, K ** len(tree_var_groups[i]))
+
+        tree_cost = _estimate_tree_cost(
+            tree_var_groups, tree_children, css_domain_est, K
+        )
+
+        if tree_cost < chain_cost:
+            use_tree = True
+
+    # Determine chosen type for reporting
+    if use_tree:
+        chosen = "tree"
+    elif chain_cuts:
+        chosen = "chain"
+    else:
+        chosen = "brute-force"
+
+    _print_cost_report(brute_cost, chain_cost, tree_cost, chosen, n, K)
+
+    # Step 5: Build the chosen decomposition
+    if use_tree:
+        decomp, precompute_info = _build_tree_decomposition(
+            logic_forward, n, K,
+            tree_var_groups, tree_children, tree_root,
+            max_precompute,
+            y_check_info=y_check_info, y_decompose_fn=y_decompose_fn,
+        )
+        info = {
+            "bottlenecks": bottlenecks[:10],
+            "decomposition_type": "tree",
+            "var_groups": tree_var_groups,
+            "children": tree_children,
+            "root": tree_root,
+            "estimated_brute_cost": brute_cost,
+            "estimated_chain_cost": chain_cost,
+            "estimated_tree_cost": tree_cost,
+            **precompute_info,
+        }
+        return decomp, info
+
+    # Fall back to chain decomposition
+    if not chain_cuts:
+        info = {
+            "bottlenecks": bottlenecks[:10],
+            "decomposition_type": "brute-force",
+            "estimated_brute_cost": brute_cost,
+            "estimated_chain_cost": brute_cost,
+            "estimated_tree_cost": tree_cost,
+        }
+        return _build_brute_chain(logic_forward, n, K), info
+
+    # Derive var_groups from chain cuts
     all_sources = [frozenset()] + [c["sources"] for c in chain_cuts] + [frozenset(range(n))]
     var_groups = []
     for i in range(len(all_sources) - 1):
@@ -278,21 +445,7 @@ def discover_decomposition(
 
     L = len(var_groups)
 
-    # Step 4: Exhaustive precomputation of transition tables
-    #
-    # For each step l (except the last), enumerate ALL (css_prev, z_vals)
-    # combinations and compute css_next by running the traced KB.
-    #
-    # This costs O(H × K^r) KB calls per step, done ONCE.
-    # After this, DP uses table lookups (O(1) per transition).
-    #
-    # Last step: verified against y at runtime (y-dependent).
-
-    # Step 4: Precompute transitions.
-    #
-    # CSS = KB output with unset vars = 0 (always a valid sufficient statistic).
-    # This gives compact scalar states. Domain grows per step, but the DP's
-    # max_states (beam search) controls runtime cost.
+    # Precompute chain transitions (with budget limit)
     import itertools
 
     def _run_kb(z_values):
@@ -301,19 +454,31 @@ def discover_decomposition(
         return res.value if isinstance(res, TracedValue) else res
 
     trans_table = [{} for _ in range(L)]
+    final_output = {}
     css_states = [set() for _ in range(L + 1)]
     css_states[0].add(None)
-
     css_representative = [{} for _ in range(L + 1)]
     css_representative[0][None] = {}
 
+    total_kb_calls = 0
+    budget_exceeded = False
+
     for step in range(L - 1):
+        if budget_exceeded:
+            break
         step_vars = var_groups[step]
         r = len(step_vars)
 
-        for css_prev in css_states[step]:
+        for css_prev in list(css_states[step]):
+            if budget_exceeded:
+                break
             rep = css_representative[step].get(css_prev, {})
             for z_vals in itertools.product(range(K), repeat=r):
+                total_kb_calls += 1
+                if total_kb_calls > max_precompute:
+                    budget_exceeded = True
+                    break
+
                 z = [0] * n
                 for vid, val in rep.items():
                     z[vid] = val
@@ -330,45 +495,131 @@ def discover_decomposition(
                         new_rep[vid] = z_vals[j]
                     css_representative[step + 1][css_next] = new_rep
 
-    # Final step: precompute KB output (representative is y-consistent for
-    # CSS = KB output, since same partial output → same final output).
-    final_output = {}
-    final_vars = var_groups[L - 1]
-    r_final = len(final_vars)
-    for css_prev in css_states[L - 1]:
-        rep = css_representative[L - 1].get(css_prev, {})
-        for z_vals in itertools.product(range(K), repeat=r_final):
-            z = [0] * n
-            for vid, val in rep.items():
-                z[vid] = val
-            for j, vid in enumerate(final_vars):
-                z[vid] = z_vals[j]
-            final_output[(css_prev, z_vals)] = _run_kb(z)
+    # Precompute final step (if within budget)
+    if not budget_exceeded:
+        final_vars = var_groups[L - 1]
+        r_final = len(final_vars)
+        for css_prev in list(css_states[L - 1]):
+            if budget_exceeded:
+                break
+            rep = css_representative[L - 1].get(css_prev, {})
+            for z_vals in itertools.product(range(K), repeat=r_final):
+                total_kb_calls += 1
+                if total_kb_calls > max_precompute:
+                    budget_exceeded = True
+                    break
 
-    total_trans = sum(len(t) for t in trans_table) + len(final_output)
+                z = [0] * n
+                for vid, val in rep.items():
+                    z[vid] = val
+                for j, vid in enumerate(final_vars):
+                    z[vid] = z_vals[j]
+                final_output[(css_prev, z_vals)] = _run_kb(z)
 
-    # Step 5: Build transition function
+    # Build chain transition function (hybrid: table + on-the-fly)
     _tt = trans_table
     _fo = final_output
+    _vg = var_groups
     _L = L
+    _n = n
+
+    _reps = {}
+    for step_idx in range(L + 1):
+        for css_val, rep in css_representative[step_idx].items():
+            _reps[(step_idx, css_val)] = rep
 
     def transition_fn(h_prev, z_vals, step, y):
         """
+        Hybrid transition: precomputed table lookup + on-the-fly fallback.
         State = KB partial output (compact scalar).
-        Intermediate: precomputed table lookup.
-        Last: compare precomputed full output with y.
         """
         if step == _L - 1:
-            y_pred = _fo.get((h_prev, z_vals))
+            key = (h_prev, z_vals)
+            y_pred = _fo.get(key)
+            if y_pred is None:
+                rep = _reps.get((step, h_prev))
+                if rep is None:
+                    return None
+                z = [0] * _n
+                for vid, val in rep.items():
+                    z[vid] = val
+                for j, vid in enumerate(_vg[step]):
+                    z[vid] = z_vals[j]
+                y_pred = _run_kb(z)
+                _fo[key] = y_pred
             if y_pred is not None and y_pred == y:
                 return ("__target__", y)
             return None
-        return _tt[step].get((h_prev, z_vals))
 
-    h_init = None  # matches css_states[0] = {None}
+        key = (h_prev, z_vals)
+        result = _tt[step].get(key)
+        if result is None:
+            rep = _reps.get((step, h_prev))
+            if rep is None:
+                return None
+            z = [0] * _n
+            for vid, val in rep.items():
+                z[vid] = val
+            for j, vid in enumerate(_vg[step]):
+                z[vid] = z_vals[j]
+            result = _run_kb(z)
+            _tt[step][key] = result
+            if (step + 1, result) not in _reps:
+                new_rep = dict(rep)
+                for j, vid in enumerate(_vg[step]):
+                    new_rep[vid] = z_vals[j]
+                _reps[(step + 1, result)] = new_rep
+        return result
+
+    h_init = None
 
     def h_final_fn(y):
         return ("__target__", y)
+
+    # ── Y-conditioned pruning ──
+    y_step_assignment = {}
+    if y_check_info and y_decompose_fn:
+        assigned = set()
+        cumulative = frozenset()
+        for step_idx in range(L):
+            cumulative = cumulative | frozenset(var_groups[step_idx])
+            for yi, z_src in y_check_info.items():
+                if yi not in assigned and z_src <= cumulative:
+                    y_step_assignment.setdefault(step_idx, []).append(yi)
+                    assigned.add(yi)
+
+        if y_step_assignment:
+            # Only wrap if some y-parts are assigned before the final step
+            early_steps = {s for s in y_step_assignment if s < L - 1}
+            if early_steps:
+                _base_tfn = transition_fn
+                _y_dec = y_decompose_fn
+                _y_asgn = y_step_assignment
+                _y_cache = {}
+
+                def _get_y_parts(y):
+                    if y not in _y_cache:
+                        _y_cache[y] = _y_dec(y)
+                    return _y_cache[y]
+
+                def transition_fn(h_prev, z_vals, step, y):
+                    h_next = _base_tfn(h_prev, z_vals, step, y)
+                    if h_next is None:
+                        return None
+                    # Y-pruning at intermediate steps
+                    if step < _L - 1 and step in _y_asgn:
+                        y_parts = _get_y_parts(y)
+                        try:
+                            h_parts = _y_dec(h_next)
+                        except Exception:
+                            return h_next
+                        for j in _y_asgn[step]:
+                            if j < len(h_parts) and j < len(y_parts):
+                                if h_parts[j] != y_parts[j]:
+                                    return None
+                    return h_next
+
+                print(f"  [Tracer] y-pruning enabled: {y_step_assignment}")
 
     decomp = make_chain(
         L=L,
@@ -381,11 +632,398 @@ def discover_decomposition(
 
     info = {
         "bottlenecks": bottlenecks[:10],
+        "decomposition_type": "chain",
         "chain_cuts": chain_cuts,
         "var_groups": var_groups,
         "css_domain_sizes": [c["min_domain"] for c in chain_cuts],
+        "estimated_brute_cost": brute_cost,
+        "estimated_chain_cost": chain_cost,
+        "estimated_tree_cost": tree_cost,
+        "precompute_complete": not budget_exceeded,
+        "precompute_kb_calls": total_kb_calls,
+        "y_step_assignment": y_step_assignment if y_step_assignment else None,
     }
     return decomp, info
+
+
+# ============================================================
+# Tree Decomposition Discovery
+# ============================================================
+
+
+def _build_hasse_tree(bottlenecks, n, min_compression=1.5):
+    """
+    Build a tree decomposition from bottleneck source sets using greedy
+    Hasse diagram construction.
+
+    Inserts bottlenecks (sorted by compression, highest first) into a tree
+    based on set inclusion. The root covers all n variables.
+
+    Returns:
+        (var_groups, children_list, root_idx) or None if no useful tree found.
+    """
+    full = frozenset(range(n))
+
+    # Filter and deduplicate bottlenecks by sources
+    seen_sources = set()
+    candidates = []
+    for b in bottlenecks:
+        src = b["sources"]
+        if src in seen_sources or src == full or len(src) == 0:
+            continue
+        if b["compression"] < min_compression:
+            continue
+        seen_sources.add(src)
+        candidates.append(src)
+
+    if not candidates:
+        return None
+
+    # Tree nodes: start with root (full set), insert candidates by inclusion
+    nodes = [full]  # index 0 = root
+    children_list = [[]]
+    root_idx = 0
+
+    for src in candidates:
+        # Find the smallest existing node that strictly contains src
+        best_parent = None
+        best_parent_size = n + 1
+        for i, existing in enumerate(nodes):
+            if src < existing and len(existing) < best_parent_size:
+                best_parent = i
+                best_parent_size = len(existing)
+
+        if best_parent is None:
+            continue  # src not a strict subset of any node, skip
+
+        new_idx = len(nodes)
+        nodes.append(src)
+        children_list.append([])
+
+        # Steal children: any child of parent that is a subset of new node
+        stolen = []
+        remaining = []
+        for ch_idx in children_list[best_parent]:
+            if nodes[ch_idx] < src:
+                stolen.append(ch_idx)
+            else:
+                remaining.append(ch_idx)
+
+        children_list[best_parent] = remaining + [new_idx]
+        children_list[new_idx] = stolen
+
+    # Derive var_groups: node's NEW variables = sources - union(children sources)
+    var_groups = []
+    for i, src in enumerate(nodes):
+        child_vars = frozenset()
+        for ch_idx in children_list[i]:
+            child_vars |= nodes[ch_idx]
+        var_groups.append(sorted(src - child_vars))
+
+    # Verify complete coverage
+    all_vars = []
+    for vg in var_groups:
+        all_vars.extend(vg)
+    if sorted(all_vars) != list(range(n)):
+        return None
+
+    # Only useful if tree has actual branching (otherwise chain is equivalent)
+    has_branch = any(len(ch) >= 2 for ch in children_list)
+    if not has_branch:
+        return None
+
+    return var_groups, children_list, root_idx
+
+
+def _estimate_brute_cost(n, K):
+    """Estimate total DP transitions for brute-force (one variable per step)."""
+    return K ** n
+
+
+def _estimate_tree_cost(var_groups, children_list, css_domain_est, K):
+    """
+    Estimate total DP transitions for a tree decomposition.
+
+    For each node: cost = product(child CSS domain sizes) × K^(num new vars).
+    """
+    total = 0
+    for i in range(len(var_groups)):
+        r = len(var_groups[i])
+        child_product = 1
+        for ch in children_list[i]:
+            child_product *= css_domain_est.get(ch, K)
+        total += child_product * (K ** r)
+    return total
+
+
+def _estimate_chain_cost(chain_cuts, n, K):
+    """
+    Estimate total DP transitions for a chain decomposition with bottlenecks.
+
+    For each step: cost = prev_css_size × K^(num new vars in this step).
+    """
+    if not chain_cuts:
+        return _estimate_brute_cost(n, K)
+
+    all_sources = [frozenset()] + [c["sources"] for c in chain_cuts] + [frozenset(range(n))]
+    total = 0
+    prev_css_size = 1
+    for i in range(len(all_sources) - 1):
+        r = len(all_sources[i + 1] - all_sources[i])
+        total += prev_css_size * (K ** r)
+        if i < len(chain_cuts):
+            prev_css_size = chain_cuts[i]["domain_size"]
+        else:
+            prev_css_size = K ** len(all_sources[i + 1])
+    return total
+
+
+def _print_cost_report(brute_cost, chain_cost, tree_cost, chosen, n, K):
+    """Print a summary of estimated DP costs and speedup ratios."""
+    print(f"  [Tracer] Cost estimation (n={n}, K={K}):")
+    print(f"    Brute-force : {brute_cost:>12,}")
+    print(f"    Chain       : {chain_cost:>12,}"
+          f"  (speedup vs brute: {brute_cost / max(chain_cost, 1):,.1f}x)")
+    if tree_cost is not None:
+        print(f"    Tree        : {tree_cost:>12,}"
+              f"  (speedup vs brute: {brute_cost / max(tree_cost, 1):,.1f}x,"
+              f"  vs chain: {chain_cost / max(tree_cost, 1):,.1f}x)")
+    else:
+        print(f"    Tree        :          N/A  (no branching structure found)")
+    print(f"    Selected    : {chosen}")
+
+
+def _build_tree_decomposition(
+    logic_forward, n, K, var_groups, children_list, root_idx, max_precompute,
+    y_check_info=None, y_decompose_fn=None,
+):
+    """
+    Build a tree Decomposition with precomputed transition tables.
+
+    Precomputes transitions via post-order traversal: leaves first, root last.
+    Each node's CSS = KB output with only that subtree's vars set, rest = 0.
+    Uses budget control + on-the-fly fallback (same strategy as chain).
+
+    Returns:
+        (Decomposition, precompute_info_dict)
+    """
+    import itertools
+
+    num_nodes = len(var_groups)
+
+    def _run_kb(z_values):
+        res = logic_forward(z_values)
+        return res.value if isinstance(res, TracedValue) else res
+
+    # Compute subtree_vars[i] = all variables in subtree rooted at i
+    subtree_vars = [None] * num_nodes
+
+    def _compute_subtree(i):
+        result = set(var_groups[i])
+        for ch in children_list[i]:
+            _compute_subtree(ch)
+            result |= subtree_vars[ch]
+        subtree_vars[i] = frozenset(result)
+
+    _compute_subtree(root_idx)
+
+    # Post-order traversal
+    order = []
+
+    def _postorder(i):
+        for ch in children_list[i]:
+            _postorder(ch)
+        order.append(i)
+
+    _postorder(root_idx)
+
+    # Precompute transition tables per node
+    # trans_table[node][(h_children_tuple, z_vals)] = css_state
+    trans_table = [{} for _ in range(num_nodes)]
+    css_states = [set() for _ in range(num_nodes)]
+    css_representative = [{} for _ in range(num_nodes)]
+
+    # Leaves start with a single "no children" state
+    for i in range(num_nodes):
+        if not children_list[i]:
+            css_states[i] = set()  # will be populated during precompute
+
+    total_kb_calls = 0
+    budget_exceeded = False
+
+    for node in order:
+        if budget_exceeded:
+            break
+
+        ch = children_list[node]
+        step_vars = var_groups[node]
+        r = len(step_vars)
+
+        # Enumerate all combinations of children CSS states
+        if ch:
+            child_h_lists = [sorted(css_states[c]) for c in ch]
+            # If any child has no states yet (shouldn't happen in post-order,
+            # but guard against it), skip
+            if any(len(hl) == 0 for hl in child_h_lists):
+                child_combos = []
+            else:
+                child_combos = list(itertools.product(*child_h_lists))
+        else:
+            child_combos = [()]  # leaves: single empty tuple
+
+        for h_combo in child_combos:
+            if budget_exceeded:
+                break
+
+            # Build representative assignment from children
+            rep = {}
+            for ci, c in enumerate(ch):
+                child_rep = css_representative[c].get(h_combo[ci], {})
+                rep.update(child_rep)
+
+            for z_vals in itertools.product(range(K), repeat=r):
+                total_kb_calls += 1
+                if total_kb_calls > max_precompute:
+                    budget_exceeded = True
+                    break
+
+                z = [0] * n
+                for vid, val in rep.items():
+                    z[vid] = val
+                for j, vid in enumerate(step_vars):
+                    z[vid] = z_vals[j]
+
+                css_next = _run_kb(z)
+                trans_table[node][(h_combo, z_vals)] = css_next
+                css_states[node].add(css_next)
+
+                if css_next not in css_representative[node]:
+                    new_rep = dict(rep)
+                    for j, vid in enumerate(step_vars):
+                        new_rep[vid] = z_vals[j]
+                    css_representative[node][css_next] = new_rep
+
+    # Build representative lookup for on-the-fly fallback
+    _reps = {}
+    for node_idx in range(num_nodes):
+        for css_val, rep in css_representative[node_idx].items():
+            _reps[(node_idx, css_val)] = rep
+
+    # Also store child representatives for reconstructing parent reps
+    _child_reps = {}
+    for node_idx in range(num_nodes):
+        for css_val, rep in css_representative[node_idx].items():
+            _child_reps[(node_idx, css_val)] = rep
+
+    _tt = trans_table
+    _vg = var_groups
+    _ch = children_list
+    _n = n
+
+    def transition_fn(h_children, z_vals, node, y):
+        """
+        Tree transition: precomputed table lookup + on-the-fly fallback.
+        h_children = tuple of child CSS states (empty for leaves).
+        """
+        is_root = (node == root_idx)
+
+        key = (h_children, z_vals)
+        result = _tt[node].get(key)
+
+        if result is None:
+            # On-the-fly: reconstruct representative and run KB
+            rep = {}
+            for ci, c in enumerate(_ch[node]):
+                child_rep = _child_reps.get((c, h_children[ci]))
+                if child_rep is None:
+                    return None
+                rep.update(child_rep)
+
+            z = [0] * _n
+            for vid, val in rep.items():
+                z[vid] = val
+            for j, vid in enumerate(_vg[node]):
+                z[vid] = z_vals[j]
+            result = _run_kb(z)
+            _tt[node][key] = result
+
+            # Cache representative for future use
+            if (node, result) not in _child_reps:
+                new_rep = dict(rep)
+                for j, vid in enumerate(_vg[node]):
+                    new_rep[vid] = z_vals[j]
+                _child_reps[(node, result)] = new_rep
+
+        if is_root:
+            if result == y:
+                return ("__target__", y)
+            return None
+
+        return result
+
+    def h_final_fn(y):
+        return ("__target__", y)
+
+    # ── Y-conditioned pruning for tree ──
+    y_node_assignment = {}
+    if y_check_info and y_decompose_fn:
+        assigned = set()
+        # Assign y-parts to the smallest subtree node that covers their z-sources
+        for yi, z_src in y_check_info.items():
+            best_node = None
+            best_size = n + 1
+            for node_idx in range(num_nodes):
+                if z_src <= subtree_vars[node_idx] and len(subtree_vars[node_idx]) < best_size:
+                    best_node = node_idx
+                    best_size = len(subtree_vars[node_idx])
+            if best_node is not None and best_node != root_idx:
+                y_node_assignment.setdefault(best_node, []).append(yi)
+                assigned.add(yi)
+
+        if y_node_assignment:
+            _base_tfn = transition_fn
+            _y_dec = y_decompose_fn
+            _y_asgn = y_node_assignment
+            _y_cache = {}
+
+            def _get_y_parts(y):
+                if y not in _y_cache:
+                    _y_cache[y] = _y_dec(y)
+                return _y_cache[y]
+
+            def transition_fn(h_children, z_vals, node, y):
+                h_next = _base_tfn(h_children, z_vals, node, y)
+                if h_next is None:
+                    return None
+                if node != root_idx and node in _y_asgn:
+                    y_parts = _get_y_parts(y)
+                    try:
+                        h_parts = _y_dec(h_next)
+                    except Exception:
+                        return h_next
+                    for j in _y_asgn[node]:
+                        if j < len(h_parts) and j < len(y_parts):
+                            if h_parts[j] != y_parts[j]:
+                                return None
+                return h_next
+
+            print(f"  [Tracer] tree y-pruning enabled: {y_node_assignment}")
+
+    decomp = make_tree(
+        var_groups=var_groups,
+        children=children_list,
+        root=root_idx,
+        transition_fn=transition_fn,
+        h_final_fn=h_final_fn,
+        n=n, H=0,
+    )
+
+    precompute_info = {
+        "precompute_complete": not budget_exceeded,
+        "precompute_kb_calls": total_kb_calls,
+        "y_node_assignment": y_node_assignment if y_node_assignment else None,
+    }
+    return decomp, precompute_info
 
 
 def _build_brute_chain(logic_forward, n, K):

@@ -145,17 +145,29 @@ class IFWReasoner(Reasoner):
             return self._decomp_cache[n]
         from .tracer import discover_decomposition
         from ..utils import print_log
+
+        # Check KB for y-conditioned CSS support
+        extra_kw = {}
+        if hasattr(self.kb, 'constraint_fn') and hasattr(self.kb, 'y_decompose_fn'):
+            extra_kw['constraint_fn'] = self.kb.constraint_fn
+            extra_kw['y_decompose_fn'] = self.kb.y_decompose_fn
+            extra_kw['y_size'] = getattr(self.kb, 'y_size', 0)
+            extra_kw['Y_domains'] = getattr(self.kb, 'Y_domains', None)
+
         decomp, info = discover_decomposition(
             self.kb.logic_forward, n=n, K=self.K, num_samples=500,
+            **extra_kw,
         )
         if isinstance(info, dict):
             cuts = info.get("chain_cuts", [])
             top_c = f"{cuts[0]['compression']:.0f}x" if cuts else "N/A"
+            y_prune = info.get("y_step_assignment") or info.get("y_node_assignment")
+            y_tag = f", y-pruning={y_prune}" if y_prune else ""
             print_log(
                 f"[{self.__class__.__name__}] Auto-decomposed n={n}: "
                 f"{len(info.get('var_groups', []))} steps, "
                 f"CSS domains={info.get('css_domain_sizes', [])}, "
-                f"top compression={top_c}",
+                f"top compression={top_c}{y_tag}",
                 logger="current",
             )
         else:
@@ -273,17 +285,28 @@ class IFWA3BLReasoner(Reasoner):
             return self._decomp_cache[n]
         from .tracer import discover_decomposition
         from ..utils import print_log
+
+        extra_kw = {}
+        if hasattr(self.kb, 'constraint_fn') and hasattr(self.kb, 'y_decompose_fn'):
+            extra_kw['constraint_fn'] = self.kb.constraint_fn
+            extra_kw['y_decompose_fn'] = self.kb.y_decompose_fn
+            extra_kw['y_size'] = getattr(self.kb, 'y_size', 0)
+            extra_kw['Y_domains'] = getattr(self.kb, 'Y_domains', None)
+
         decomp, info = discover_decomposition(
             self.kb.logic_forward, n=n, K=self.K, num_samples=500,
+            **extra_kw,
         )
         if isinstance(info, dict):
             cuts = info.get("chain_cuts", [])
             top_c = f"{cuts[0]['compression']:.0f}x" if cuts else "N/A"
+            y_prune = info.get("y_step_assignment") or info.get("y_node_assignment")
+            y_tag = f", y-pruning={y_prune}" if y_prune else ""
             print_log(
                 f"[{self.__class__.__name__}] Auto-decomposed n={n}: "
                 f"{len(info.get('var_groups', []))} steps, "
                 f"CSS domains={info.get('css_domain_sizes', [])}, "
-                f"top compression={top_c}",
+                f"top compression={top_c}{y_tag}",
                 logger="current",
             )
         else:
