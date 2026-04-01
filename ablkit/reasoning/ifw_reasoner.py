@@ -124,6 +124,9 @@ class IFWReasoner(Reasoner):
         perception_threshold: float = 0.0,
         auto_decompose: bool = True,
         auto_decompose_n: Optional[int] = None,
+        auto_decompose_num_samples: int = 500,
+        auto_decompose_max_precompute: int = 100_000,
+        auto_decompose_lazy_precompute: bool = False,
         **kwargs,
     ):
         super().__init__(kb, dist_func="confidence", idx_to_label=idx_to_label, **kwargs)
@@ -131,6 +134,9 @@ class IFWReasoner(Reasoner):
         self.max_states = max_states
         self.perception_top_k = perception_top_k
         self.perception_threshold = perception_threshold
+        self.auto_decompose_num_samples = auto_decompose_num_samples
+        self.auto_decompose_max_precompute = auto_decompose_max_precompute
+        self.auto_decompose_lazy_precompute = auto_decompose_lazy_precompute
         self._n_abduce = 0
         self._n_valid = 0
         self._decomp_cache = {}
@@ -155,7 +161,13 @@ class IFWReasoner(Reasoner):
             extra_kw['Y_domains'] = getattr(self.kb, 'Y_domains', None)
 
         decomp, info = discover_decomposition(
-            self.kb.logic_forward, n=n, K=self.K, num_samples=500,
+            self.kb.logic_forward,
+            n=n,
+            K=self.K,
+            num_samples=self.auto_decompose_num_samples,
+            max_precompute=self.auto_decompose_max_precompute,
+            max_states=self.max_states,
+            lazy_precompute=self.auto_decompose_lazy_precompute,
             **extra_kw,
         )
         if isinstance(info, dict):
@@ -163,11 +175,21 @@ class IFWReasoner(Reasoner):
             top_c = f"{cuts[0]['compression']:.0f}x" if cuts else "N/A"
             y_prune = info.get("y_step_assignment") or info.get("y_node_assignment")
             y_tag = f", y-pruning={y_prune}" if y_prune else ""
+            precompute_tag = ""
+            if "precompute_mode" in info:
+                precompute_tag = (
+                    f", precompute={info.get('precompute_mode')}"
+                    f"/{info.get('precompute_kb_calls')}"
+                )
+            state_tag = f", state={info.get('state_mode')}" if info.get("state_mode") else ""
+            tw_tag = ""
+            if "treewidth" in info:
+                tw_tag = f", treewidth={info.get('treewidth')}"
             print_log(
                 f"[{self.__class__.__name__}] Auto-decomposed n={n}: "
                 f"{len(info.get('var_groups', []))} steps, "
                 f"CSS domains={info.get('css_domain_sizes', [])}, "
-                f"top compression={top_c}{y_tag}",
+                f"top compression={top_c}{y_tag}{precompute_tag}{state_tag}{tw_tag}",
                 logger="current",
             )
         else:
@@ -262,7 +284,11 @@ class IFWA3BLReasoner(Reasoner):
         max_states: int = 0,
         perception_top_k: int = 0,
         perception_threshold: float = 0.0,
+        auto_decompose: bool = True,
         auto_decompose_n: Optional[int] = None,
+        auto_decompose_num_samples: int = 500,
+        auto_decompose_max_precompute: int = 100_000,
+        auto_decompose_lazy_precompute: bool = False,
         **kwargs,
     ):
         super().__init__(kb, dist_func="confidence", idx_to_label=idx_to_label, **kwargs)
@@ -272,6 +298,9 @@ class IFWA3BLReasoner(Reasoner):
         self.max_states = max_states
         self.perception_top_k = perception_top_k
         self.perception_threshold = perception_threshold
+        self.auto_decompose_num_samples = auto_decompose_num_samples
+        self.auto_decompose_max_precompute = auto_decompose_max_precompute
+        self.auto_decompose_lazy_precompute = auto_decompose_lazy_precompute
         self._decomp_cache = {}
         self._n_abduce = 0
         self._n_valid = 0
@@ -294,7 +323,13 @@ class IFWA3BLReasoner(Reasoner):
             extra_kw['Y_domains'] = getattr(self.kb, 'Y_domains', None)
 
         decomp, info = discover_decomposition(
-            self.kb.logic_forward, n=n, K=self.K, num_samples=500,
+            self.kb.logic_forward,
+            n=n,
+            K=self.K,
+            num_samples=self.auto_decompose_num_samples,
+            max_precompute=self.auto_decompose_max_precompute,
+            max_states=self.max_states,
+            lazy_precompute=self.auto_decompose_lazy_precompute,
             **extra_kw,
         )
         if isinstance(info, dict):
@@ -302,11 +337,21 @@ class IFWA3BLReasoner(Reasoner):
             top_c = f"{cuts[0]['compression']:.0f}x" if cuts else "N/A"
             y_prune = info.get("y_step_assignment") or info.get("y_node_assignment")
             y_tag = f", y-pruning={y_prune}" if y_prune else ""
+            precompute_tag = ""
+            if "precompute_mode" in info:
+                precompute_tag = (
+                    f", precompute={info.get('precompute_mode')}"
+                    f"/{info.get('precompute_kb_calls')}"
+                )
+            state_tag = f", state={info.get('state_mode')}" if info.get("state_mode") else ""
+            tw_tag = ""
+            if "treewidth" in info:
+                tw_tag = f", treewidth={info.get('treewidth')}"
             print_log(
                 f"[{self.__class__.__name__}] Auto-decomposed n={n}: "
                 f"{len(info.get('var_groups', []))} steps, "
                 f"CSS domains={info.get('css_domain_sizes', [])}, "
-                f"top compression={top_c}{y_tag}",
+                f"top compression={top_c}{y_tag}{precompute_tag}{state_tag}{tw_tag}",
                 logger="current",
             )
         else:
