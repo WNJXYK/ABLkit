@@ -782,16 +782,16 @@ def _build_decomposition(
                         new_rep[vid] = z_vals[j]
                     css_representative[node][css_next] = new_rep
 
-        # Beam-prune: keep only top max_states CSS states by frequency
+        # Beam-prune css_states to limit downstream enumeration.
+        # Only css_states is pruned (controls child combos at next node).
+        # trans_table / css_representative are KEPT as cache — the on-the-fly
+        # fallback in transition_fn can still serve pruned states at DP runtime.
         if max_states > 0 and len(css_states[node]) > max_states:
             freq = defaultdict(int)
             for css in trans_table[node].values():
                 freq[css] += 1
             top = set(s for s, _ in sorted(freq.items(), key=lambda x: -x[1])[:max_states])
             css_states[node] = top
-            trans_table[node] = {k: v for k, v in trans_table[node].items() if v in top}
-            partial_table[node] = {k: v for k, v in partial_table[node].items() if k in trans_table[node]}
-            css_representative[node] = {k: v for k, v in css_representative[node].items() if k in top}
 
     # Representative lookup for on-the-fly fallback
     _reps = {}
