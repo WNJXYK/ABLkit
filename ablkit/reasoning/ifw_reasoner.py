@@ -30,6 +30,7 @@ class PerceptionMonitor:
 
     Signals:
         should_restart: avg_domain_size spiked vs historical best → perception degraded
+                        OR domain stagnated above threshold for too long → never learned
         should_stop: avg_domain_size ≈ 1 and validity ≈ 1 sustained → converged
     """
 
@@ -38,6 +39,8 @@ class PerceptionMonitor:
         enabled: bool = False,
         warmup: int = 3,
         restart_threshold: float = 3.0,
+        stagnation_window: int = 10,
+        stagnation_domain_min: float = 1.5,
         converge_window: int = 5,
         converge_domain_max: float = 1.5,
         converge_validity_min: float = 0.95,
@@ -45,6 +48,8 @@ class PerceptionMonitor:
         self.enabled = enabled
         self.warmup = warmup
         self.restart_threshold = restart_threshold
+        self.stagnation_window = stagnation_window
+        self.stagnation_domain_min = stagnation_domain_min
         self.converge_window = converge_window
         self.converge_domain_max = converge_domain_max
         self.converge_validity_min = converge_validity_min
@@ -101,13 +106,29 @@ class PerceptionMonitor:
 
     @property
     def should_restart(self) -> bool:
-        """Perception degraded: domain size spiked relative to historical best."""
+        """Perception degraded (spike) or stagnated (never learned).
+
+        Spike: current domain > baseline * restart_threshold.
+        Stagnation: domain stayed above stagnation_domain_min for
+                    stagnation_window consecutive batches after warmup.
+        """
         if not self.enabled or len(self._history) <= self.warmup:
             return False
         post_warmup = self._history[self.warmup:]
+
+        # Spike detection
         baseline = min(s["avg_domain_size"] for s in post_warmup)
         current = self._history[-1]["avg_domain_size"]
-        return current > baseline * self.restart_threshold
+        if current > baseline * self.restart_threshold:
+            return True
+
+        # Stagnation detection
+        if len(post_warmup) >= self.stagnation_window:
+            recent = post_warmup[-self.stagnation_window:]
+            if all(s["avg_domain_size"] > self.stagnation_domain_min for s in recent):
+                return True
+
+        return False
 
     @property
     def should_stop(self) -> bool:
