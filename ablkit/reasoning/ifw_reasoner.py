@@ -8,10 +8,129 @@ Supports chain and tree decompositions via unified dp_map/dp_marginal.
 """
 
 import math
+import statistics
 from typing import Any, Callable, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
+
+
+# ================================================================
+#  Perception Health Monitor
+# ================================================================
+
+class PerceptionMonitor:
+    """Monitors perception quality via var_domain statistics.
+
+    Tracks per-batch statistics and exposes early-restart / early-stop signals.
+
+    The causal chain being monitored:
+        perception degrades → pred_prob flattens → var_domains expand
+        → DP search space explodes → abduction quality drops → death spiral
+
+    Signals:
+        should_restart: avg_domain_size spiked vs historical best → perception degraded
+        should_stop: avg_domain_size ≈ 1 and validity ≈ 1 sustained → converged
+    """
+
+    def __init__(
+        self,
+        enabled: bool = False,
+        warmup: int = 3,
+        restart_threshold: float = 3.0,
+        converge_window: int = 5,
+        converge_domain_max: float = 1.5,
+        converge_validity_min: float = 0.95,
+    ):
+        self.enabled = enabled
+        self.warmup = warmup
+        self.restart_threshold = restart_threshold
+        self.converge_window = converge_window
+        self.converge_domain_max = converge_domain_max
+        self.converge_validity_min = converge_validity_min
+
+        # Per-example accumulator within a batch
+        self._batch_domain_sizes: List[float] = []
+        self._batch_max_probs: List[float] = []
+        self._batch_n_abduce = 0
+        self._batch_n_valid = 0
+
+        # Per-batch history
+        self._history: List[dict] = []
+
+    def record_abduce(self, var_domains, pred_prob, n, K, valid: bool):
+        """Called after each abduce() to record per-example stats."""
+        if not self.enabled:
+            return
+        # Domain size: how many candidates per variable after pruning
+        if var_domains is not None:
+            avg_ds = sum(len(d) for d in var_domains) / max(n, 1)
+        else:
+            avg_ds = float(K)  # no pruning = full domain
+        self._batch_domain_sizes.append(avg_ds)
+
+        # Max probability: how confident is perception
+        avg_mp = sum(max(pred_prob[i]) for i in range(n)) / max(n, 1)
+        self._batch_max_probs.append(avg_mp)
+
+        self._batch_n_abduce += 1
+        if valid:
+            self._batch_n_valid += 1
+
+    def end_batch(self):
+        """Called after batch_abduce() to commit batch stats to history."""
+        if not self.enabled or not self._batch_domain_sizes:
+            self._batch_domain_sizes.clear()
+            self._batch_max_probs.clear()
+            self._batch_n_abduce = 0
+            self._batch_n_valid = 0
+            return
+
+        entry = {
+            "avg_domain_size": statistics.mean(self._batch_domain_sizes),
+            "avg_max_prob": statistics.mean(self._batch_max_probs),
+            "validity_ratio": self._batch_n_valid / max(self._batch_n_abduce, 1),
+            "n_abduce": self._batch_n_abduce,
+        }
+        self._history.append(entry)
+
+        self._batch_domain_sizes.clear()
+        self._batch_max_probs.clear()
+        self._batch_n_abduce = 0
+        self._batch_n_valid = 0
+
+    @property
+    def should_restart(self) -> bool:
+        """Perception degraded: domain size spiked relative to historical best."""
+        if not self.enabled or len(self._history) <= self.warmup:
+            return False
+        post_warmup = self._history[self.warmup:]
+        baseline = min(s["avg_domain_size"] for s in post_warmup)
+        current = self._history[-1]["avg_domain_size"]
+        return current > baseline * self.restart_threshold
+
+    @property
+    def should_stop(self) -> bool:
+        """Converged: domain ≈ 1 and validity ≈ 1 sustained over window."""
+        if not self.enabled or len(self._history) < self.warmup + self.converge_window:
+            return False
+        recent = self._history[-self.converge_window:]
+        return (
+            all(s["avg_domain_size"] <= self.converge_domain_max for s in recent)
+            and all(s["validity_ratio"] >= self.converge_validity_min for s in recent)
+        )
+
+    @property
+    def last_stats(self) -> Optional[dict]:
+        return self._history[-1] if self._history else None
+
+    def reset(self):
+        """Reset after a restart (keep config, clear history)."""
+        self._history.clear()
+        self._batch_domain_sizes.clear()
+        self._batch_max_probs.clear()
+        self._batch_n_abduce = 0
+        self._batch_n_valid = 0
 
 from ..data.structures import ListData
 from ..reasoning import KBBase
@@ -127,6 +246,7 @@ class IFWReasoner(Reasoner):
         auto_decompose_num_samples: int = 500,
         auto_decompose_max_precompute: int = 100_000,
         auto_decompose_lazy_precompute: bool = False,
+        monitor: bool = False,
         **kwargs,
     ):
         super().__init__(kb, dist_func="confidence", idx_to_label=idx_to_label, **kwargs)
@@ -140,6 +260,7 @@ class IFWReasoner(Reasoner):
         self._n_abduce = 0
         self._n_valid = 0
         self._decomp_cache = {}
+        self.monitor = PerceptionMonitor(enabled=monitor)
 
         if auto_decompose_n is not None:
             # Fixed n: discover once at init
@@ -208,7 +329,6 @@ class IFWReasoner(Reasoner):
 
         decomp = self._get_decomp(n)
 
-        # Compute var_domains from raw probabilities (before log transform)
         var_domains = _compute_var_domains(
             pred_prob, n, K, self.perception_top_k, self.perception_threshold,
         )
@@ -223,15 +343,20 @@ class IFWReasoner(Reasoner):
                               max_states=self.max_states)
 
         self._n_abduce += 1
-        if score <= float("-inf"):
-            return []
-        self._n_valid += 1
+        valid = score > float("-inf")
+        if valid:
+            self._n_valid += 1
 
+        self.monitor.record_abduce(var_domains, pred_prob, n, K, valid)
+
+        if not valid:
+            return []
         return [self.idx_to_label[z_hat[i]] for i in range(n)]
 
     def batch_abduce(self, data_examples: ListData) -> List[List[Any]]:
         abduced = [self.abduce(ex) for ex in data_examples]
         data_examples.abduced_pseudo_label = abduced
+        self.monitor.end_batch()
         return abduced
 
     def __call__(self, data_examples: ListData) -> List[List[Any]]:
@@ -273,6 +398,7 @@ class IFWA3BLReasoner(Reasoner):
         max_states: Beam width for sparse DP (0=unlimited).
         perception_top_k: If > 0, only consider top-k values per variable.
         perception_threshold: If > 0, keep values with prob >= threshold * max_prob.
+        monitor: If True, enable PerceptionMonitor for early restart/stop signals.
     """
 
     def __init__(
@@ -289,6 +415,7 @@ class IFWA3BLReasoner(Reasoner):
         auto_decompose_num_samples: int = 500,
         auto_decompose_max_precompute: int = 100_000,
         auto_decompose_lazy_precompute: bool = False,
+        monitor: bool = False,
         **kwargs,
     ):
         super().__init__(kb, dist_func="confidence", idx_to_label=idx_to_label, **kwargs)
@@ -304,6 +431,7 @@ class IFWA3BLReasoner(Reasoner):
         self._decomp_cache = {}
         self._n_abduce = 0
         self._n_valid = 0
+        self.monitor = PerceptionMonitor(enabled=monitor)
 
         if auto_decompose_n is not None:
             self._decomp_cache[auto_decompose_n] = self._discover(auto_decompose_n)
@@ -371,7 +499,6 @@ class IFWA3BLReasoner(Reasoner):
 
         decomp = self._get_decomp(n)
 
-        # Temperature-scaled probabilities
         p = []
         for i in range(n):
             row_raw = [max(float(pred_prob[i][k]), 1e-30) for k in range(K)]
@@ -392,9 +519,14 @@ class IFWA3BLReasoner(Reasoner):
                            max_states=self.max_states)
 
         self._n_abduce += 1
-        if Z <= 0:
+        valid = Z > 0
+        if valid:
+            self._n_valid += 1
+
+        self.monitor.record_abduce(var_domains, pred_prob, n, K, valid)
+
+        if not valid:
             return [], []
-        self._n_valid += 1
 
         soft_labels = [torch.tensor(q[i], dtype=torch.float32) for i in range(n)]
         hard_labels = [
@@ -405,6 +537,7 @@ class IFWA3BLReasoner(Reasoner):
 
     def batch_abduce(self, data_examples: ListData) -> List[List[Any]]:
         results = [self.abduce(ex) for ex in data_examples]
+        self.monitor.end_batch()
         if not results:
             data_examples.abduced_soft_label = []
             data_examples.abduced_pseudo_label = []
