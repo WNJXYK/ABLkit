@@ -116,8 +116,10 @@ class PerceptionMonitor:
             return False
         post_warmup = self._history[self.warmup:]
 
-        # Spike detection
-        baseline = min(s["avg_domain_size"] for s in post_warmup)
+        # Spike detection: compare current vs median of recent history
+        # (median is robust to lucky outliers, unlike min)
+        recent_domains = [s["avg_domain_size"] for s in post_warmup[-self.stagnation_window:]]
+        baseline = statistics.median(recent_domains)
         current = self._history[-1]["avg_domain_size"]
         if current > baseline * self.restart_threshold:
             return True
@@ -377,8 +379,11 @@ class IFWReasoner(Reasoner):
     def batch_abduce(self, data_examples: ListData) -> List[List[Any]]:
         abduced = [self.abduce(ex) for ex in data_examples]
         data_examples.abduced_pseudo_label = abduced
-        self.monitor.end_batch()
         return abduced
+
+    def end_loop(self):
+        """Commit accumulated per-example stats as one history entry (call after each ABL loop)."""
+        self.monitor.end_batch()
 
     def __call__(self, data_examples: ListData) -> List[List[Any]]:
         return self.batch_abduce(data_examples)
@@ -558,7 +563,6 @@ class IFWA3BLReasoner(Reasoner):
 
     def batch_abduce(self, data_examples: ListData) -> List[List[Any]]:
         results = [self.abduce(ex) for ex in data_examples]
-        self.monitor.end_batch()
         if not results:
             data_examples.abduced_soft_label = []
             data_examples.abduced_pseudo_label = []
@@ -567,6 +571,10 @@ class IFWA3BLReasoner(Reasoner):
         data_examples.abduced_soft_label = list(soft)
         data_examples.abduced_pseudo_label = list(hard)
         return list(soft)
+
+    def end_loop(self):
+        """Commit accumulated per-example stats as one history entry (call after each ABL loop)."""
+        self.monitor.end_batch()
 
     def __call__(self, data_examples: ListData) -> List[List[Any]]:
         return self.batch_abduce(data_examples)
