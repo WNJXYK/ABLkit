@@ -161,6 +161,171 @@ from .reasoner import Reasoner
 from .ifw_dp import Decomposition, dp_map, dp_marginal
 
 
+# ================================================================
+#  IFWKB — IFW as KB acceleration backend
+# ================================================================
+
+class IFWKB(KBBase):
+    """KB wrapper that uses IFW-DP for fast candidate enumeration.
+
+    Wraps an existing traceable KB and overrides ``abduce_candidates``
+    to use dp_map instead of brute-force search. Returns a single MAP
+    candidate, compatible with both Reasoner (ABL) and A3BLReasoner.
+
+    Usage::
+
+        inner_kb = MyTraceableKB()
+        kb = IFWKB(inner_kb, perception_threshold=0.05)
+        reasoner = IFWABLReasoner(kb)  # or Reasoner(kb) with manual pred_prob bridging
+
+    Args:
+        inner_kb: A KBBase subclass whose logic_forward supports TracedValue.
+        perception_threshold: Pruning threshold for var_domains.
+        max_states: Beam width for sparse DP.
+        monitor: Enable PerceptionMonitor for warmup / restart signals.
+        auto_decompose_num_samples: Samples for bottleneck discovery.
+        auto_decompose_max_precompute: Budget for precomputation.
+    """
+
+    def __init__(
+        self,
+        inner_kb: KBBase,
+        perception_threshold: float = 0.0,
+        max_states: int = 100,
+        monitor: bool = False,
+        auto_decompose_num_samples: int = 500,
+        auto_decompose_max_precompute: int = 100_000,
+    ):
+        super().__init__(inner_kb.pseudo_label_list, inner_kb.max_err, use_cache=False)
+        self._inner_kb = inner_kb
+        self.perception_threshold = perception_threshold
+        self.max_states = max_states
+        self.auto_decompose_num_samples = auto_decompose_num_samples
+        self.auto_decompose_max_precompute = auto_decompose_max_precompute
+        self._decomp_cache = {}
+        self._pred_prob = None  # set by IFWABLReasoner before abduce_candidates
+        self.monitor = PerceptionMonitor(enabled=monitor)
+
+        # Label ↔ index mappings
+        self.idx_to_label = {i: lbl for i, lbl in enumerate(self.pseudo_label_list)}
+        self.label_to_idx = {lbl: i for i, lbl in enumerate(self.pseudo_label_list)}
+
+    def logic_forward(self, z, x=None):
+        if self._inner_kb._num_args == 2:
+            return self._inner_kb.logic_forward(z, x)
+        return self._inner_kb.logic_forward(z)
+
+    def _get_decomp(self, n: int) -> Decomposition:
+        if n in self._decomp_cache:
+            return self._decomp_cache[n]
+        from .tracer import discover_decomposition
+        from ..utils import print_log
+
+        extra_kw = {}
+        kb = self._inner_kb
+        if hasattr(kb, 'constraint_fn') and hasattr(kb, 'y_decompose_fn'):
+            extra_kw['constraint_fn'] = kb.constraint_fn
+            extra_kw['y_decompose_fn'] = kb.y_decompose_fn
+            extra_kw['y_size'] = getattr(kb, 'y_size', 0)
+            extra_kw['Y_domains'] = getattr(kb, 'Y_domains', None)
+
+        decomp, info = discover_decomposition(
+            kb.logic_forward,
+            n=n,
+            K=len(self.pseudo_label_list),
+            num_samples=self.auto_decompose_num_samples,
+            max_precompute=self.auto_decompose_max_precompute,
+            max_states=self.max_states,
+            **extra_kw,
+        )
+        if isinstance(info, dict):
+            print_log(
+                f"[IFWKB] Auto-decomposed n={n}: "
+                f"{len(info.get('var_groups', []))} steps, "
+                f"CSS domains={info.get('css_domain_sizes', [])}, "
+                f"type={info.get('decomposition_type', '?')}",
+                logger="current",
+            )
+        self._decomp_cache[n] = decomp
+        return decomp
+
+    @property
+    def _in_warmup(self) -> bool:
+        return self.monitor.enabled and len(self.monitor._history) < self.monitor.warmup
+
+    def abduce_candidates(self, pseudo_label, y, x, max_revision_num, require_more_revision):
+        """IFW-accelerated candidate enumeration.
+
+        If pred_prob is available (set by IFWABLReasoner), uses dp_map to find
+        the MAP candidate in O(L·K^r·H). Otherwise falls back to inner KB's
+        brute-force search.
+
+        Returns:
+            (candidates, reasoning_results) — same interface as KBBase.
+        """
+        if self._pred_prob is None:
+            return self._inner_kb.abduce_candidates(
+                pseudo_label, y, x, max_revision_num, require_more_revision,
+            )
+
+        n = len(pseudo_label)
+        K = len(self.pseudo_label_list)
+        decomp = self._get_decomp(n)
+        pred_prob = _normalize_pred_prob(self._pred_prob, K)
+
+        # Warmup: no perception pruning
+        if self._in_warmup:
+            var_domains = None
+        else:
+            var_domains = _compute_var_domains(
+                pred_prob, n, K, 0, self.perception_threshold,
+            )
+
+        log_p = [
+            [math.log(max(float(pred_prob[i][k]), 1e-30)) for k in range(K)]
+            for i in range(n)
+        ]
+
+        z_hat, score = dp_map(
+            decomp, K, y, log_p,
+            var_domains=var_domains,
+            max_states=self.max_states,
+        )
+
+        # Monitor
+        valid = score > float("-inf")
+        self.monitor.record_abduce(var_domains, pred_prob, n, K, valid)
+
+        if not valid:
+            return [], []
+
+        candidate = [self.idx_to_label[z_hat[i]] for i in range(n)]
+        result = self.logic_forward(candidate, x)
+
+        if self._check_equal(result, y):
+            return [candidate], [result]
+        return [], []
+
+
+class IFWABLReasoner(Reasoner):
+    """Base ABL Reasoner with IFWKB acceleration.
+
+    Thin wrapper: injects pred_prob into IFWKB before abduce_candidates,
+    then delegates ALL selection logic to the base Reasoner.
+    """
+
+    def abduce(self, data_example: ListData) -> List[Any]:
+        self.kb._pred_prob = data_example.pred_prob
+        result = super().abduce(data_example)
+        self.kb._pred_prob = None
+        return result
+
+    def end_loop(self):
+        """Commit monitor stats for this loop."""
+        if hasattr(self.kb, 'monitor'):
+            self.kb.monitor.end_batch()
+
+
 def _normalize_pred_prob(pred_prob, K: int):
     """
     Normalize pred_prob to a list of K-element distributions.
