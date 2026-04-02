@@ -344,6 +344,11 @@ class IFWReasoner(Reasoner):
     def _get_decomp(self, n: int) -> Decomposition:
         return self._discover(n)
 
+    @property
+    def _in_warmup(self) -> bool:
+        """True during monitor warmup — perception pruning is disabled."""
+        return self.monitor.enabled and len(self.monitor._history) < self.monitor.warmup
+
     def abduce(self, data_example: ListData) -> List[Any]:
         pred_prob = _normalize_pred_prob(data_example.pred_prob, self.K)
         y = data_example.Y
@@ -352,9 +357,13 @@ class IFWReasoner(Reasoner):
 
         decomp = self._get_decomp(n)
 
-        var_domains = _compute_var_domains(
-            pred_prob, n, K, self.perception_top_k, self.perception_threshold,
-        )
+        # Disable perception pruning during warmup to avoid poisoning early training
+        if self._in_warmup:
+            var_domains = None
+        else:
+            var_domains = _compute_var_domains(
+                pred_prob, n, K, self.perception_top_k, self.perception_threshold,
+            )
 
         log_p = [
             [math.log(max(float(pred_prob[i][k]), 1e-30)) for k in range(K)]
@@ -516,6 +525,10 @@ class IFWA3BLReasoner(Reasoner):
     def _get_decomp(self, n: int) -> Decomposition:
         return self._discover(n)
 
+    @property
+    def _in_warmup(self) -> bool:
+        return self.monitor.enabled and len(self.monitor._history) < self.monitor.warmup
+
     def abduce(self, data_example: ListData) -> Tuple[List[Any], List[Any]]:
         pred_prob = _normalize_pred_prob(data_example.pred_prob, self.K)
         y = data_example.Y
@@ -536,9 +549,12 @@ class IFWA3BLReasoner(Reasoner):
                 row = row_raw
             p.append(row)
 
-        var_domains = _compute_var_domains(
-            p, n, K, self.perception_top_k, self.perception_threshold,
-        )
+        if self._in_warmup:
+            var_domains = None
+        else:
+            var_domains = _compute_var_domains(
+                p, n, K, self.perception_top_k, self.perception_threshold,
+            )
 
         q, Z = dp_marginal(decomp, K, y, p,
                            var_domains=var_domains,
