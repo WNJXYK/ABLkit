@@ -256,30 +256,32 @@ class IFWKB(KBBase):
         return self.monitor.enabled and len(self.monitor._history) < self.monitor.warmup
 
     def abduce_candidates(self, pseudo_label, y, x, max_revision_num, require_more_revision):
-        """IFW-accelerated candidate enumeration.
+        """IFW-accelerated candidate enumeration matching base ABL behavior.
 
-        If pred_prob is available (set by IFWABLReasoner), uses dp_map to find
-        the MAP candidate in O(L·K^r·H). Otherwise falls back to inner KB's
-        brute-force search.
+        Incremental revision search: tries revision=0, 1, 2, ... just like
+        base KB._abduce_by_search. At each level, for each combination of
+        positions to revise, uses dp_map with non-revised positions locked
+        to pseudo_label values. This gives identical "prefer fewer revisions"
+        behavior while each revision-level search runs via DP.
 
-        Returns:
-            (candidates, reasoning_results) — same interface as KBBase.
+        Falls back to inner KB when pred_prob is unavailable.
         """
         if self._pred_prob is None:
             return self._inner_kb.abduce_candidates(
                 pseudo_label, y, x, max_revision_num, require_more_revision,
             )
 
+        from itertools import combinations
+
         n = len(pseudo_label)
         K = len(self.pseudo_label_list)
         decomp = self._get_decomp(n)
         pred_prob = _normalize_pred_prob(self._pred_prob, K)
 
-        # Warmup: no perception pruning
         if self._in_warmup:
-            var_domains = None
+            perception_domains = None
         else:
-            var_domains = _compute_var_domains(
+            perception_domains = _compute_var_domains(
                 pred_prob, n, K, 0, self.perception_threshold,
             )
 
@@ -288,34 +290,62 @@ class IFWKB(KBBase):
             for i in range(n)
         ]
 
-        # Revision prior: bonus for keeping pseudo_label unchanged.
-        # This makes dp_map prefer minimal-revision solutions, matching
-        # base ABL's incremental search behavior.
-        if self.revision_prior > 0:
-            for i, lbl in enumerate(pseudo_label):
-                idx = self.label_to_idx.get(lbl)
-                if idx is not None and 0 <= idx < K:
-                    log_p[i][idx] += self.revision_prior
+        pseudo_idx = [self.label_to_idx.get(lbl, 0) for lbl in pseudo_label]
 
-        z_hat, score = dp_map(
-            decomp, K, y, log_p,
-            var_domains=var_domains,
-            max_states=self.max_states,
-        )
+        candidates = []
+        reasoning_results = []
+        found_at_revision = None
+
+        for num_rev in range(max_revision_num + 1):
+            if found_at_revision is not None and num_rev > found_at_revision + require_more_revision:
+                break
+
+            if num_rev == 0:
+                res = self.logic_forward(pseudo_label, x)
+                if self._check_equal(res, y):
+                    candidates.append(list(pseudo_label))
+                    reasoning_results.append(res)
+                    if found_at_revision is None:
+                        found_at_revision = 0
+                continue
+
+            for rev_idx in combinations(range(n), num_rev):
+                rev_set = set(rev_idx)
+                # Lock non-revised positions to pseudo_label value;
+                # revised positions use perception-pruned domains (or full K).
+                var_domains_locked = []
+                for i in range(n):
+                    if i in rev_set:
+                        if perception_domains is not None:
+                            var_domains_locked.append(perception_domains[i])
+                        else:
+                            var_domains_locked.append(list(range(K)))
+                    else:
+                        var_domains_locked.append([pseudo_idx[i]])
+
+                z_hat, score = dp_map(
+                    decomp, K, y, log_p,
+                    var_domains=var_domains_locked,
+                    max_states=self.max_states,
+                )
+
+                if score <= float("-inf"):
+                    continue
+
+                candidate = [self.idx_to_label[z_hat[i]] for i in range(n)]
+                res = self.logic_forward(candidate, x)
+                if self._check_equal(res, y) and candidate not in candidates:
+                    candidates.append(candidate)
+                    reasoning_results.append(res)
+                    if found_at_revision is None:
+                        found_at_revision = num_rev
 
         # Monitor
-        valid = score > float("-inf")
-        self.monitor.record_abduce(var_domains, pred_prob, n, K, valid)
+        self.monitor.record_abduce(
+            perception_domains, pred_prob, n, K, len(candidates) > 0,
+        )
 
-        if not valid:
-            return [], []
-
-        candidate = [self.idx_to_label[z_hat[i]] for i in range(n)]
-        result = self.logic_forward(candidate, x)
-
-        if self._check_equal(result, y):
-            return [candidate], [result]
-        return [], []
+        return candidates, reasoning_results
 
 
 class IFWABLReasoner(Reasoner):
