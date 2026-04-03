@@ -192,6 +192,7 @@ class IFWKB(KBBase):
         inner_kb: KBBase,
         perception_threshold: float = 0.0,
         max_states: int = 100,
+        revision_prior: float = 2.0,
         monitor: bool = False,
         auto_decompose_num_samples: int = 500,
         auto_decompose_max_precompute: int = 100_000,
@@ -200,6 +201,7 @@ class IFWKB(KBBase):
         self._inner_kb = inner_kb
         self.perception_threshold = perception_threshold
         self.max_states = max_states
+        self.revision_prior = revision_prior
         self.auto_decompose_num_samples = auto_decompose_num_samples
         self.auto_decompose_max_precompute = auto_decompose_max_precompute
         self._decomp_cache = {}
@@ -285,6 +287,15 @@ class IFWKB(KBBase):
             [math.log(max(float(pred_prob[i][k]), 1e-30)) for k in range(K)]
             for i in range(n)
         ]
+
+        # Revision prior: bonus for keeping pseudo_label unchanged.
+        # This makes dp_map prefer minimal-revision solutions, matching
+        # base ABL's incremental search behavior.
+        if self.revision_prior > 0:
+            for i, lbl in enumerate(pseudo_label):
+                idx = self.label_to_idx.get(lbl)
+                if idx is not None and 0 <= idx < K:
+                    log_p[i][idx] += self.revision_prior
 
         z_hat, score = dp_map(
             decomp, K, y, log_p,
