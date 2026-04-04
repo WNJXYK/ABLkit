@@ -398,6 +398,109 @@ class IFWABLReasoner(Reasoner):
             self.kb.monitor.end_batch()
 
 
+class IFWA3BLReasoner_v2(Reasoner):
+    """A3BL-compatible Reasoner using IFWKB's revision-aware dp_marginal.
+
+    Computes posterior marginals via dp_marginal with revision-augmented
+    state, matching base A3BL's behavior: marginals are computed only over
+    solutions within the revision budget.
+
+    Returns soft labels (marginal probabilities) and hard labels (argmax).
+    """
+
+    def __init__(self, kb, temperature: float = 1.0, **kwargs):
+        super().__init__(kb, dist_func="confidence", **kwargs)
+        self.temperature = temperature
+        self.K = len(kb.pseudo_label_list)
+        self.class_num = self.K
+        self._n_abduce = 0
+        self._n_valid = 0
+
+    def abduce(self, data_example: ListData) -> Tuple[List[Any], List[Any]]:
+        pred_prob = _normalize_pred_prob(data_example.pred_prob, self.K)
+        pseudo_label = data_example.pred_pseudo_label
+        y = data_example.Y
+        n = len(pred_prob)
+        K = self.K
+        T = self.temperature
+
+        # Temperature-scaled probabilities
+        p = []
+        for i in range(n):
+            row_raw = [max(float(pred_prob[i][k]), 1e-30) for k in range(K)]
+            if T != 1.0:
+                row_pow = [r ** (1.0 / T) for r in row_raw]
+                total = sum(row_pow)
+                row = [r / total for r in row_pow]
+            else:
+                row = row_raw
+            p.append(row)
+
+        kb = self.kb
+        decomp = kb._get_decomp(n)
+
+        if kb._in_warmup:
+            var_domains = None
+        else:
+            var_domains = _compute_var_domains(
+                p, n, K, 0, kb.perception_threshold,
+            )
+
+        # Build revision-aware decomposition
+        pseudo_idx = [kb.label_to_idx.get(lbl, 0) for lbl in pseudo_label]
+        symbol_num = n
+        max_revision_num = self._get_max_revision_num(self.max_revision, symbol_num)
+        rev_decomp, h_accept = kb._build_revision_decomp(decomp, pseudo_idx, max_revision_num)
+        rev_decomp.h_final_fn(y)  # pre-compute expected final
+
+        q, Z = dp_marginal(
+            rev_decomp, K, y, p,
+            var_domains=var_domains,
+            max_states=kb.max_states,
+            h_final_accept=h_accept,
+        )
+
+        self._n_abduce += 1
+        valid = Z > 0
+        if valid:
+            self._n_valid += 1
+
+        kb.monitor.record_abduce(var_domains, pred_prob, n, K, valid)
+
+        if not valid:
+            return [], []
+
+        soft_labels = [torch.tensor(q[i], dtype=torch.float32) for i in range(n)]
+        hard_labels = [
+            kb.idx_to_label[max(range(K), key=lambda k: q[i][k])]
+            for i in range(n)
+        ]
+        return soft_labels, hard_labels
+
+    def batch_abduce(self, data_examples: ListData) -> List[List[Any]]:
+        # Set pred_prob on KB for each example
+        results = []
+        for ex in data_examples:
+            self.kb._pred_prob = ex.pred_prob
+            results.append(self.abduce(ex))
+            self.kb._pred_prob = None
+        if not results:
+            data_examples.abduced_soft_label = []
+            data_examples.abduced_pseudo_label = []
+            return []
+        soft, hard = zip(*results)
+        data_examples.abduced_soft_label = list(soft)
+        data_examples.abduced_pseudo_label = list(hard)
+        return list(soft)
+
+    def end_loop(self):
+        if hasattr(self.kb, 'monitor'):
+            self.kb.monitor.end_batch()
+
+    def __call__(self, data_examples: ListData) -> List[List[Any]]:
+        return self.batch_abduce(data_examples)
+
+
 def _normalize_pred_prob(pred_prob, K: int):
     """
     Normalize pred_prob to a list of K-element distributions.

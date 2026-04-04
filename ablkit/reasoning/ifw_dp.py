@@ -296,6 +296,7 @@ def dp_marginal(
     p: List[List[float]],
     var_domains: Optional[List[List[int]]] = None,
     max_states: int = 0,
+    h_final_accept: Callable = None,
 ) -> Tuple[List[List[float]], float]:
     """
     Marginal abduction on tree/chain decomposition.
@@ -360,15 +361,28 @@ def dp_marginal(
 
     # Partition function
     root = decomp.root
-    h_final = decomp.h_final_fn(y)
-    Z = alpha[root].get(h_final, 0.0)
-    if Z < 1e-300:
-        return [[1.0 / K] * K for _ in range(n)], 0.0
+    if h_final_accept is not None:
+        # Sum over all accepted root states
+        Z = 0.0
+        accepted_states = {}
+        for h, a in alpha[root].items():
+            if h_final_accept(h):
+                Z += a
+                accepted_states[h] = a
+        if Z < 1e-300:
+            return [[1.0 / K] * K for _ in range(n)], 0.0
+        beta_root = {h: a / Z for h, a in accepted_states.items()}
+    else:
+        h_final = decomp.h_final_fn(y)
+        Z = alpha[root].get(h_final, 0.0)
+        if Z < 1e-300:
+            return [[1.0 / K] * K for _ in range(n)], 0.0
+        beta_root = {h_final: 1.0}
 
     # ── Downward pass (root → leaves): compute beta + marginals ──
     # beta[node] = {h: external probability}
     beta = [None] * len(decomp.var_groups)
-    beta[root] = {h_final: 1.0}
+    beta[root] = beta_root
 
     q = [[0.0] * K for _ in range(n)]
 
