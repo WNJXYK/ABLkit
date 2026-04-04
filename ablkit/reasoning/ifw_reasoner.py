@@ -192,7 +192,7 @@ class IFWKB(KBBase):
         inner_kb: KBBase,
         perception_threshold: float = 0.0,
         max_states: int = 100,
-        revision_prior: float = 2.0,
+        revision_prior: float = 100.0,
         monitor: bool = False,
         auto_decompose_num_samples: int = 500,
         auto_decompose_max_precompute: int = 100_000,
@@ -255,14 +255,76 @@ class IFWKB(KBBase):
     def _in_warmup(self) -> bool:
         return self.monitor.enabled and len(self.monitor._history) < self.monitor.warmup
 
-    def abduce_candidates(self, pseudo_label, y, x, max_revision_num, require_more_revision):
-        """IFW-accelerated candidate enumeration matching base ABL behavior.
+    def _build_revision_decomp(self, decomp, pseudo_idx, max_revision_num):
+        """Wrap decomp with revision-count tracking in CSS state.
 
-        Incremental revision search: tries revision=0, 1, 2, ... just like
-        base KB._abduce_by_search. At each level, for each combination of
-        positions to revise, uses dp_map with non-revised positions locked
-        to pseudo_label values. This gives identical "prefer fewer revisions"
-        behavior while each revision-level search runs via DP.
+        Augmented state: (h_original, n_revisions).
+        At each node, counts how many positions differ from pseudo_label.
+        Prunes paths exceeding max_revision_num.
+
+        Complexity: H * (max_revision+1) states per node.
+        """
+        orig_tfn = decomp.transition_fn
+        orig_hfinal = decomp.h_final_fn
+        vg = decomp.var_groups
+        _pseudo = pseudo_idx
+        _max_rev = max_revision_num
+
+        def transition_fn(h_children, z_vals, node, y):
+            if h_children:
+                h_orig = tuple(h[0] for h in h_children)
+                n_rev = sum(h[1] for h in h_children)
+            else:
+                h_orig = ()
+                n_rev = 0
+
+            for j, vid in enumerate(vg[node]):
+                if z_vals[j] != _pseudo[vid]:
+                    n_rev += 1
+                    if n_rev > _max_rev:
+                        return None
+
+            h_next = orig_tfn(h_orig, z_vals, node, y)
+            if h_next is None:
+                return None
+
+            return (h_next, n_rev)
+
+        # h_final_accept: accept (h_final, any_n_rev) at root
+        _expected_final = None  # set lazily
+
+        def h_final_accept(h):
+            """Return (True, n_rev) for priority sorting, or False to reject.
+            dp_map picks: min n_rev first, then max score."""
+            nonlocal _expected_final
+            if not isinstance(h, tuple) or len(h) != 2:
+                return False
+            h_orig, n_rev = h
+            if _expected_final is not None and h_orig != _expected_final:
+                return False
+            if n_rev > _max_rev:
+                return False
+            return n_rev + 1  # +1 so 0 revisions returns 1 (truthy), not 0 (falsy)
+
+        def h_final_fn(y):
+            nonlocal _expected_final
+            _expected_final = orig_hfinal(y)
+            return (_expected_final, 0)  # dummy, not used when h_final_accept is set
+
+        return Decomposition(
+            n=decomp.n, var_groups=decomp.var_groups, children=decomp.children,
+            root=decomp.root, transition_fn=transition_fn,
+            h_final_fn=h_final_fn, H=0,
+        ), h_final_accept
+
+    def abduce_candidates(self, pseudo_label, y, x, max_revision_num, require_more_revision):
+        """IFW-accelerated candidate enumeration with revision-aware DP.
+
+        Augments the DP state with a revision counter: (h, n_rev).
+        Each step checks if z_vals differs from pseudo_label and increments.
+        Paths exceeding max_revision are pruned. This gives exact base-ABL
+        behavior (prefer fewest revisions) in a single O(L·K^r·H·R) dp_map
+        call, where R = max_revision+1.
 
         Falls back to inner KB when pred_prob is unavailable.
         """
@@ -271,17 +333,15 @@ class IFWKB(KBBase):
                 pseudo_label, y, x, max_revision_num, require_more_revision,
             )
 
-        from itertools import combinations
-
         n = len(pseudo_label)
         K = len(self.pseudo_label_list)
         decomp = self._get_decomp(n)
         pred_prob = _normalize_pred_prob(self._pred_prob, K)
 
         if self._in_warmup:
-            perception_domains = None
+            var_domains = None
         else:
-            perception_domains = _compute_var_domains(
+            var_domains = _compute_var_domains(
                 pred_prob, n, K, 0, self.perception_threshold,
             )
 
@@ -292,60 +352,31 @@ class IFWKB(KBBase):
 
         pseudo_idx = [self.label_to_idx.get(lbl, 0) for lbl in pseudo_label]
 
-        candidates = []
-        reasoning_results = []
-        found_at_revision = None
+        # Build revision-aware decomposition
+        rev_decomp, h_accept = self._build_revision_decomp(decomp, pseudo_idx, max_revision_num)
 
-        for num_rev in range(max_revision_num + 1):
-            if found_at_revision is not None and num_rev > found_at_revision + require_more_revision:
-                break
+        # Pre-compute expected h_final so h_accept can filter
+        rev_decomp.h_final_fn(y)
 
-            if num_rev == 0:
-                res = self.logic_forward(pseudo_label, x)
-                if self._check_equal(res, y):
-                    candidates.append(list(pseudo_label))
-                    reasoning_results.append(res)
-                    if found_at_revision is None:
-                        found_at_revision = 0
-                continue
-
-            for rev_idx in combinations(range(n), num_rev):
-                rev_set = set(rev_idx)
-                # Lock non-revised positions to pseudo_label value;
-                # revised positions use perception-pruned domains (or full K).
-                var_domains_locked = []
-                for i in range(n):
-                    if i in rev_set:
-                        if perception_domains is not None:
-                            var_domains_locked.append(perception_domains[i])
-                        else:
-                            var_domains_locked.append(list(range(K)))
-                    else:
-                        var_domains_locked.append([pseudo_idx[i]])
-
-                z_hat, score = dp_map(
-                    decomp, K, y, log_p,
-                    var_domains=var_domains_locked,
-                    max_states=self.max_states,
-                )
-
-                if score <= float("-inf"):
-                    continue
-
-                candidate = [self.idx_to_label[z_hat[i]] for i in range(n)]
-                res = self.logic_forward(candidate, x)
-                if self._check_equal(res, y) and candidate not in candidates:
-                    candidates.append(candidate)
-                    reasoning_results.append(res)
-                    if found_at_revision is None:
-                        found_at_revision = num_rev
-
-        # Monitor
-        self.monitor.record_abduce(
-            perception_domains, pred_prob, n, K, len(candidates) > 0,
+        z_hat, score = dp_map(
+            rev_decomp, K, y, log_p,
+            var_domains=var_domains,
+            max_states=self.max_states,
+            h_final_accept=h_accept,
         )
 
-        return candidates, reasoning_results
+        valid = score > float("-inf")
+        self.monitor.record_abduce(var_domains, pred_prob, n, K, valid)
+
+        if not valid:
+            return [], []
+
+        candidate = [self.idx_to_label[z_hat[i]] for i in range(n)]
+        res = self.logic_forward(candidate, x)
+
+        if self._check_equal(res, y):
+            return [candidate], [res]
+        return [], []
 
 
 class IFWABLReasoner(Reasoner):

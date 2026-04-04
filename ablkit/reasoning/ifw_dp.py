@@ -178,6 +178,7 @@ def dp_map(
     log_p: List[List[float]],
     var_domains: Optional[List[List[int]]] = None,
     max_states: int = 0,
+    h_final_accept: Callable = None,
 ) -> Tuple[List[int], float]:
     """
     MAP abduction on tree/chain decomposition.
@@ -241,10 +242,32 @@ def dp_map(
         node_best[node] = new_states
 
     # Check root
-    h_final = decomp.h_final_fn(y)
     root = decomp.root
-    if h_final not in node_best[root]:
-        return [0] * decomp.n, NEG_INF
+    if h_final_accept is not None:
+        # Custom acceptance: find best accepted state at root.
+        # Sort by h_final_accept's returned priority (lower = better),
+        # then by score (higher = better).
+        h_final = None
+        best_key = None
+        for h, (sc, _, _) in node_best[root].items():
+            priority = h_final_accept(h)
+            if not priority:
+                continue
+            # priority: int = revision_count+1 (lower = fewer revisions = better)
+            #           True = accept without ordering
+            if isinstance(priority, bool):
+                key = (0, sc)
+            else:
+                key = (-int(priority), sc)  # negate: fewer revisions → higher key
+            if best_key is None or key > best_key:
+                best_key = key
+                h_final = h
+        if h_final is None:
+            return [0] * decomp.n, NEG_INF
+    else:
+        h_final = decomp.h_final_fn(y)
+        if h_final not in node_best[root]:
+            return [0] * decomp.n, NEG_INF
 
     # Traceback: root to leaves
     best_z = [0] * decomp.n
