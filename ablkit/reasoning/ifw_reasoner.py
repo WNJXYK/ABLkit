@@ -205,6 +205,9 @@ class IFWKB(KBBase):
         self.auto_decompose_num_samples = auto_decompose_num_samples
         self.auto_decompose_max_precompute = auto_decompose_max_precompute
         self._decomp_cache = {}
+        self._rev_decomp_cache = {}
+        self._rev_pseudo_idx = None  # set per-sample in abduce_candidates
+        self._rev_max = 0
         self._pred_prob = None  # set by IFWABLReasoner before abduce_candidates
         self.monitor = PerceptionMonitor(enabled=monitor)
 
@@ -255,20 +258,20 @@ class IFWKB(KBBase):
     def _in_warmup(self) -> bool:
         return self.monitor.enabled and len(self.monitor._history) < self.monitor.warmup
 
-    def _build_revision_decomp(self, decomp, pseudo_idx, max_revision_num):
+    def _build_revision_decomp(self, decomp):
         """Wrap decomp with revision-count tracking in CSS state.
 
         Augmented state: (h_original, n_revisions).
-        At each node, counts how many positions differ from pseudo_label.
-        Prunes paths exceeding max_revision_num.
+        Reads pseudo_idx and max_revision from self._rev_pseudo_idx and
+        self._rev_max at call time — so the SAME decomp object can be
+        reused across samples (just update self._rev_pseudo_idx).
 
         Complexity: H * (max_revision+1) states per node.
         """
         orig_tfn = decomp.transition_fn
         orig_hfinal = decomp.h_final_fn
         vg = decomp.var_groups
-        _pseudo = pseudo_idx
-        _max_rev = max_revision_num
+        _self = self  # capture IFWKB instance
 
         def transition_fn(h_children, z_vals, node, y):
             if h_children:
@@ -278,6 +281,8 @@ class IFWKB(KBBase):
                 h_orig = ()
                 n_rev = 0
 
+            _pseudo = _self._rev_pseudo_idx
+            _max_rev = _self._rev_max
             for j, vid in enumerate(vg[node]):
                 if z_vals[j] != _pseudo[vid]:
                     n_rev += 1
@@ -290,32 +295,28 @@ class IFWKB(KBBase):
 
             return (h_next, n_rev)
 
-        # h_final_accept: accept (h_final, any_n_rev) at root
-        _expected_final = None  # set lazily
+        _expected_final = [None]
 
         def h_final_accept(h):
-            """Return (True, n_rev) for priority sorting, or False to reject.
-            dp_map picks: min n_rev first, then max score."""
-            nonlocal _expected_final
             if not isinstance(h, tuple) or len(h) != 2:
                 return False
             h_orig, n_rev = h
-            if _expected_final is not None and h_orig != _expected_final:
+            if _expected_final[0] is not None and h_orig != _expected_final[0]:
                 return False
-            if n_rev > _max_rev:
+            if n_rev > _self._rev_max:
                 return False
-            return n_rev + 1  # +1 so 0 revisions returns 1 (truthy), not 0 (falsy)
+            return n_rev + 1
 
         def h_final_fn(y):
-            nonlocal _expected_final
-            _expected_final = orig_hfinal(y)
-            return (_expected_final, 0)  # dummy, not used when h_final_accept is set
+            _expected_final[0] = orig_hfinal(y)
+            return (_expected_final[0], 0)
 
-        return Decomposition(
+        rev_decomp = Decomposition(
             n=decomp.n, var_groups=decomp.var_groups, children=decomp.children,
             root=decomp.root, transition_fn=transition_fn,
             h_final_fn=h_final_fn, H=0,
-        ), h_final_accept
+        )
+        return rev_decomp, h_final_accept
 
     def abduce_candidates(self, pseudo_label, y, x, max_revision_num, require_more_revision):
         """IFW-accelerated candidate enumeration with revision-aware DP.
@@ -352,10 +353,16 @@ class IFWKB(KBBase):
 
         pseudo_idx = [self.label_to_idx.get(lbl, 0) for lbl in pseudo_label]
 
-        # Build revision-aware decomposition
-        rev_decomp, h_accept = self._build_revision_decomp(decomp, pseudo_idx, max_revision_num)
+        # Set per-sample revision state (read by cached transition_fn)
+        self._rev_pseudo_idx = pseudo_idx
+        self._rev_max = max_revision_num
 
-        # Pre-compute expected h_final so h_accept can filter
+        # Build revision-aware decomposition (cached per n)
+        cache_key = n
+        if cache_key not in self._rev_decomp_cache:
+            self._rev_decomp_cache[cache_key] = self._build_revision_decomp(decomp)
+        rev_decomp, h_accept = self._rev_decomp_cache[cache_key]
+
         rev_decomp.h_final_fn(y)
 
         z_hat, score = dp_map(
@@ -446,12 +453,17 @@ class IFWA3BLReasoner_v2(Reasoner):
                 p, n, K, 0, kb.perception_threshold,
             )
 
-        # Build revision-aware decomposition
+        # Build revision-aware decomposition (cached, per-sample state via kb._rev_*)
         pseudo_idx = [kb.label_to_idx.get(lbl, 0) for lbl in pseudo_label]
         symbol_num = n
         max_revision_num = self._get_max_revision_num(self.max_revision, symbol_num)
-        rev_decomp, h_accept = kb._build_revision_decomp(decomp, pseudo_idx, max_revision_num)
-        rev_decomp.h_final_fn(y)  # pre-compute expected final
+        kb._rev_pseudo_idx = pseudo_idx
+        kb._rev_max = max_revision_num
+        cache_key = n
+        if cache_key not in kb._rev_decomp_cache:
+            kb._rev_decomp_cache[cache_key] = kb._build_revision_decomp(decomp)
+        rev_decomp, h_accept = kb._rev_decomp_cache[cache_key]
+        rev_decomp.h_final_fn(y)
 
         q, Z = dp_marginal(
             rev_decomp, K, y, p,
