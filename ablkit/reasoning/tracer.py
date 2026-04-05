@@ -998,11 +998,9 @@ def discover_decomposition(
             yield css_pos
         yield None  # full tuple fallback
 
-    # 2. Generate candidate topologies
+    # 2. Generate candidate topologies (chain only — simpler, batch-friendly)
     _topology_builders = [
         ("chain",   lambda: _chain_topology(_greedy_chain_cover(bottlenecks, n, min_compression), n)),
-        ("tree",    lambda: _build_hasse_tree(bottlenecks, n, min_compression)),
-        ("minfill", lambda: _css_aware_minfill(n, K, bottlenecks, min_compression)),
     ]
 
     candidates = []
@@ -1484,8 +1482,6 @@ def _print_cost_report(cost_by_name, candidate_meta, chosen, n, K):
 
     for name, label, ref_name in [
         ("chain",   "Chain      ", None),
-        ("tree",    "Tree       ", "chain"),
-        ("minfill", "MinFill    ", "chain"),
     ]:
         cost = cost_by_name.get(name)
         if cost is None:
