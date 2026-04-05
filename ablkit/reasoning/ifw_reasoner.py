@@ -346,8 +346,11 @@ class IFWKB(KBBase):
                 pred_prob, n, K, 0, self.perception_threshold,
             )
 
+        # Use raw probabilities as DP scores (not log-prob).
+        # dp_map maximizes Σ score[i][z_i]. With raw p, this matches
+        # base ABL's confidence_dist: argmax Σ p[i][k].
         log_p = [
-            [math.log(max(float(pred_prob[i][k]), 1e-30)) for k in range(K)]
+            [float(pred_prob[i][k]) for k in range(K)]
             for i in range(n)
         ]
 
@@ -428,7 +431,7 @@ class IFWABLReasoner(Reasoner):
         for ex in data_examples:
             pred_prob = _normalize_pred_prob(ex.pred_prob, K)
             n = len(pred_prob)
-            log_p = [[math.log(max(float(pred_prob[i][k]), 1e-30)) for k in range(K)]
+            log_p = [[float(pred_prob[i][k]) for k in range(K)]
                       for i in range(n)]
             all_log_p.append(log_p)
             all_y.append(ex.Y)
