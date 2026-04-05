@@ -389,8 +389,9 @@ class IFWKB(KBBase):
 class IFWABLReasoner(Reasoner):
     """Base ABL Reasoner with IFWKB acceleration.
 
-    Thin wrapper: injects pred_prob into IFWKB before abduce_candidates,
-    then delegates ALL selection logic to the base Reasoner.
+    Per-sample: injects pred_prob into IFWKB, uses revision-aware dp_map.
+    Batch mode: uses BatchDPEngine for batched MAP over all samples with
+    the same (n, y), then applies base Reasoner's selection logic.
     """
 
     def abduce(self, data_example: ListData) -> List[Any]:
@@ -398,6 +399,75 @@ class IFWABLReasoner(Reasoner):
         result = super().abduce(data_example)
         self.kb._pred_prob = None
         return result
+
+    def batch_abduce(self, data_examples: ListData) -> List[List[Any]]:
+        """Batched MAP abduction using BatchDPEngine."""
+        from .ifw_batch import BatchDPEngine
+        from collections import defaultdict
+
+        kb = self.kb
+        K = len(kb.pseudo_label_list)
+        n_examples = len(data_examples)
+        if n_examples == 0:
+            data_examples.abduced_pseudo_label = []
+            return []
+
+        # Collect data
+        all_log_p = []
+        all_y = []
+        all_n = []
+        for ex in data_examples:
+            pred_prob = _normalize_pred_prob(ex.pred_prob, K)
+            n = len(pred_prob)
+            log_p = [
+                [math.log(max(float(pred_prob[i][k]), 1e-30)) for k in range(K)]
+                for i in range(n)
+            ]
+            all_log_p.append(log_p)
+            all_y.append(ex.Y)
+            all_n.append(n)
+
+        # Group by (n, y)
+        groups = defaultdict(list)
+        for i, (n_i, y_i) in enumerate(zip(all_n, all_y)):
+            groups[(n_i, y_i)].append(i)
+
+        results = [[] for _ in range(n_examples)]
+
+        for (n_i, y_i), indices in groups.items():
+            decomp = kb._get_decomp(n_i)
+
+            engine_key = (n_i, y_i)
+            if not hasattr(kb, '_batch_engine_cache'):
+                kb._batch_engine_cache = {}
+            if engine_key not in kb._batch_engine_cache:
+                kb._batch_engine_cache[engine_key] = BatchDPEngine(
+                    decomp, K, y_i, device='cpu',
+                )
+            engine = kb._batch_engine_cache[engine_key]
+
+            log_p_batch = torch.tensor([all_log_p[i] for i in indices], dtype=torch.float32)
+            z_batch, score_batch = engine.batch_map(log_p_batch)
+
+            for gi, idx in enumerate(indices):
+                score = score_batch[gi].item()
+                if score <= -1e29:
+                    results[idx] = []
+                else:
+                    z_hat = z_batch[gi].tolist()
+                    results[idx] = [kb.idx_to_label[z_hat[v]] for v in range(n_i)]
+
+                # Monitor
+                pred_prob = _normalize_pred_prob(data_examples[idx].pred_prob, K)
+                n = len(pred_prob)
+                vd = None if kb._in_warmup else _compute_var_domains(
+                    [[max(float(pred_prob[i][k]), 1e-30) for k in range(K)] for i in range(n)],
+                    n, K, 0, kb.perception_threshold,
+                )
+                kb.monitor.record_abduce(vd, pred_prob, n, K, score > -1e29)
+
+        data_examples.abduced_pseudo_label = results
+        return results
 
     def end_loop(self):
         """Commit monitor stats for this loop."""
@@ -490,20 +560,93 @@ class IFWA3BLReasoner_v2(Reasoner):
         return soft_labels, hard_labels
 
     def batch_abduce(self, data_examples: ListData) -> List[List[Any]]:
-        # Set pred_prob on KB for each example
-        results = []
-        for ex in data_examples:
-            self.kb._pred_prob = ex.pred_prob
-            results.append(self.abduce(ex))
-            self.kb._pred_prob = None
-        if not results:
+        from .ifw_batch import BatchDPEngine
+        from collections import defaultdict
+
+        kb = self.kb
+        K = self.K
+        T = self.temperature
+        n_examples = len(data_examples)
+        if n_examples == 0:
             data_examples.abduced_soft_label = []
             data_examples.abduced_pseudo_label = []
             return []
-        soft, hard = zip(*results)
-        data_examples.abduced_soft_label = list(soft)
-        data_examples.abduced_pseudo_label = list(hard)
-        return list(soft)
+
+        # Collect per-example data
+        all_p = []       # list of (n_i, K) probs
+        all_y = []
+        all_n = []
+        for ex in data_examples:
+            pred_prob = _normalize_pred_prob(ex.pred_prob, K)
+            n = len(pred_prob)
+            p = []
+            for i in range(n):
+                row = [max(float(pred_prob[i][k]), 1e-30) for k in range(K)]
+                if T != 1.0:
+                    row = [r ** (1.0 / T) for r in row]
+                    s = sum(row)
+                    row = [r / s for r in row]
+                p.append(row)
+            all_p.append(p)
+            all_y.append(ex.Y)
+            all_n.append(n)
+
+        # Group by (n, y) for batching — same decomp structure & engine
+        groups = defaultdict(list)  # (n, y) -> [indices]
+        for i, (n_i, y_i) in enumerate(zip(all_n, all_y)):
+            groups[(n_i, y_i)].append(i)
+
+        # Results storage
+        soft_results = [None] * n_examples
+        hard_results = [None] * n_examples
+        valid_flags = [False] * n_examples
+
+        for (n_i, y_i), indices in groups.items():
+            decomp = kb._get_decomp(n_i)
+
+            # Build or retrieve batch engine for this (n, y)
+            engine_key = (n_i, y_i)
+            if not hasattr(kb, '_batch_engine_cache'):
+                kb._batch_engine_cache = {}
+            if engine_key not in kb._batch_engine_cache:
+                kb._batch_engine_cache[engine_key] = BatchDPEngine(
+                    decomp, K, y_i, device='cpu',
+                )
+            engine = kb._batch_engine_cache[engine_key]
+
+            # Build p_batch tensor
+            p_batch = torch.tensor([all_p[i] for i in indices], dtype=torch.float32)
+            # (N_group, n_i, K)
+
+            q_batch, Z_batch = engine.batch_marginal(p_batch)
+            # q_batch: (N_group, n_i, K), Z_batch: (N_group,)
+
+            for gi, idx in enumerate(indices):
+                Z = Z_batch[gi].item()
+                self._n_abduce += 1
+                if Z > 0:
+                    self._n_valid += 1
+                    valid_flags[idx] = True
+                    soft = [q_batch[gi, v, :] for v in range(n_i)]
+                    hard = [kb.idx_to_label[q_batch[gi, v, :].argmax().item()] for v in range(n_i)]
+                    soft_results[idx] = soft
+                    hard_results[idx] = hard
+                else:
+                    soft_results[idx] = []
+                    hard_results[idx] = []
+
+                # Monitor
+                pred_prob = _normalize_pred_prob(data_examples[idx].pred_prob, K)
+                n = len(pred_prob)
+                if kb._in_warmup:
+                    vd = None
+                else:
+                    vd = _compute_var_domains(all_p[idx], n, K, 0, kb.perception_threshold)
+                kb.monitor.record_abduce(vd, pred_prob, n, K, valid_flags[idx])
+
+        data_examples.abduced_soft_label = soft_results
+        data_examples.abduced_pseudo_label = hard_results
+        return soft_results
 
     def end_loop(self):
         if hasattr(self.kb, 'monitor'):
