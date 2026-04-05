@@ -443,10 +443,17 @@ class IFWABLReasoner(Reasoner):
 
         for n_i, indices in groups.items():
             decomp = kb._get_decomp(n_i)
+
+            # Brute-force decomp → per-sample fallback
+            if not getattr(decomp, '_reps', None):
+                for idx in indices:
+                    results[idx] = self.abduce(data_examples[idx])
+                continue
+
             if not hasattr(kb, '_batch_engine_cache'):
                 kb._batch_engine_cache = {}
             if n_i not in kb._batch_engine_cache:
-                _kb = kb; _d = decomp; _reps = getattr(decomp, '_reps', {})
+                _kb = kb; _d = decomp; _reps = decomp._reps
                 def _root_output(h_combo, z_vals, node,
                                  __kb=_kb, __d=_d, __reps=_reps):
                     ch = __d.children[node]; z = [0] * __d.n
@@ -622,15 +629,24 @@ class IFWA3BLReasoner_v2(Reasoner):
         for n_i, indices in groups.items():
             decomp = kb._get_decomp(n_i)
 
+            # Brute-force decomp (no _reps) → fall back to per-sample
+            if not getattr(decomp, '_reps', None):
+                for idx in indices:
+                    self.kb._pred_prob = data_examples[idx].pred_prob
+                    soft, hard = self.abduce(data_examples[idx])
+                    self.kb._pred_prob = None
+                    soft_results[idx] = soft
+                    hard_results[idx] = hard
+                    valid_flags[idx] = bool(soft)
+                continue
+
             # Build or retrieve batch engine (y-independent, keyed by n only)
             if not hasattr(kb, '_batch_engine_cache'):
                 kb._batch_engine_cache = {}
             if n_i not in kb._batch_engine_cache:
-                # Root output fn: reconstruct z from representatives + z_vals,
-                # compute KB output, return h_final(kb_output). No y-check.
                 _kb = kb
                 _d = decomp
-                _reps = getattr(decomp, '_reps', {})
+                _reps = decomp._reps
 
                 def _root_output(h_combo, z_vals, node,
                                  __kb=_kb, __d=_d, __reps=_reps):
