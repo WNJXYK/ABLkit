@@ -389,9 +389,11 @@ class IFWKB(KBBase):
 class IFWABLReasoner(Reasoner):
     """Base ABL Reasoner with IFWKB acceleration.
 
-    Per-sample: injects pred_prob into IFWKB, uses revision-aware dp_map.
-    Batch mode: uses BatchDPEngine for batched MAP over all samples with
-    the same (n, y), then applies base Reasoner's selection logic.
+    Per-sample: injects pred_prob into IFWKB, uses revision-aware dp_map
+    via abduce_candidates. Inherits all selection logic from base Reasoner.
+
+    Note: batch_abduce uses per-sample path (not BatchDPEngine) because
+    revision-aware DP requires per-sample pseudo_label.
     """
 
     def abduce(self, data_example: ListData) -> List[Any]:
@@ -401,96 +403,14 @@ class IFWABLReasoner(Reasoner):
         return result
 
     def batch_abduce(self, data_examples: ListData) -> List[List[Any]]:
-        """Batched MAP abduction using BatchDPEngine."""
-        from .ifw_batch import BatchDPEngine
-        from collections import defaultdict
+        """Per-sample MAP abduction via revision-aware dp_map.
 
-        kb = self.kb
-        K = len(kb.pseudo_label_list)
-        n_examples = len(data_examples)
-        if n_examples == 0:
-            data_examples.abduced_pseudo_label = []
-            return []
-
-        # Collect data
-        all_log_p = []
-        all_y = []
-        all_n = []
-        for ex in data_examples:
-            pred_prob = _normalize_pred_prob(ex.pred_prob, K)
-            n = len(pred_prob)
-            log_p = [
-                [math.log(max(float(pred_prob[i][k]), 1e-30)) for k in range(K)]
-                for i in range(n)
-            ]
-            all_log_p.append(log_p)
-            all_y.append(ex.Y)
-            all_n.append(n)
-
-        # Group by n (engine is y-independent)
-        groups = defaultdict(list)
-        for i, n_i in enumerate(all_n):
-            groups[n_i].append(i)
-
-        results = [[] for _ in range(n_examples)]
-
-        for n_i, indices in groups.items():
-            decomp = kb._get_decomp(n_i)
-
-            if not hasattr(kb, '_batch_engine_cache'):
-                kb._batch_engine_cache = {}
-            if n_i not in kb._batch_engine_cache:
-                # Root output fn: reconstruct z from representatives + z_vals,
-                # compute KB output, return h_final(kb_output). No y-check.
-                _kb = kb
-                _d = decomp
-                _reps = getattr(decomp, '_reps', {})
-
-                def _root_output(h_combo, z_vals, node,
-                                 __kb=_kb, __d=_d, __reps=_reps):
-                    ch = __d.children[node]
-                    z = [0] * __d.n
-                    for ci, c in enumerate(ch):
-                        rep = __reps.get((c, h_combo[ci]))
-                        if rep:
-                            for vid, val in rep.items():
-                                z[vid] = val
-                    for j, vid in enumerate(__d.var_groups[node]):
-                        z[vid] = z_vals[j]
-                    labels = [__kb.idx_to_label[z[v]] for v in range(len(z))]
-                    kb_out = __kb.logic_forward(labels)
-                    if kb_out is None:
-                        return None
-                    return ("__target__", kb_out)
-
-                kb._batch_engine_cache[n_i] = BatchDPEngine(
-                    decomp, K, device='cpu', root_output_fn=_root_output,
-                )
-            engine = kb._batch_engine_cache[n_i]
-
-            log_p_batch = torch.tensor([all_log_p[i] for i in indices], dtype=torch.float32)
-            y_list = [all_y[i] for i in indices]
-            z_batch, score_batch = engine.batch_map(y_list, log_p_batch)
-
-            for gi, idx in enumerate(indices):
-                score = score_batch[gi].item()
-                if score <= -1e29:
-                    results[idx] = []
-                else:
-                    z_hat = z_batch[gi].tolist()
-                    results[idx] = [kb.idx_to_label[z_hat[v]] for v in range(n_i)]
-
-                # Monitor
-                pred_prob = _normalize_pred_prob(data_examples[idx].pred_prob, K)
-                n = len(pred_prob)
-                vd = None if kb._in_warmup else _compute_var_domains(
-                    [[max(float(pred_prob[i][k]), 1e-30) for k in range(K)] for i in range(n)],
-                    n, K, 0, kb.perception_threshold,
-                )
-                kb.monitor.record_abduce(vd, pred_prob, n, K, score > -1e29)
-
-        data_examples.abduced_pseudo_label = results
-        return results
+        Uses per-sample path (not BatchDPEngine) because revision-aware
+        DP requires per-sample pseudo_label for revision counting.
+        """
+        abduced = [self.abduce(ex) for ex in data_examples]
+        data_examples.abduced_pseudo_label = abduced
+        return abduced
 
     def end_loop(self):
         """Commit monitor stats for this loop."""

@@ -181,8 +181,6 @@ class BatchDPEngine:
             ch = decomp.children[node]
 
             for ch_idx, z_vals, h_next_idx in self.trans[node]:
-                if h_next_idx is None:
-                    continue  # skip unresolved root transitions in backward
                 if h_next_idx >= beta[node].shape[1]:
                     continue
                 b_h = beta[node][:, h_next_idx]
@@ -242,12 +240,6 @@ class BatchDPEngine:
             r = len(var_ids)
             ch = decomp.children[node]
 
-            if node == root and self._root_has_unresolved:
-                unique_ys = list(set(y_batch))
-                for y_val in unique_ys:
-                    self._resolve_root_h(y_val)
-                H_n = self.H(node)
-
             sc = torch.full((N, H_n), NEG_INF, device=dev)
             bz = torch.zeros(N, H_n, max(r, 1), dtype=torch.long, device=dev)
             bh = {}
@@ -259,35 +251,13 @@ class BatchDPEngine:
                 for ci, c in enumerate(ch):
                     s = s + scores_dict[c][:, ch_idx[ci]]
 
-                if h_next_idx is not None:
-                    better = s > sc[:, h_next_idx]
-                    sc[:, h_next_idx] = torch.where(better, s, sc[:, h_next_idx])
-                    for j in range(r):
-                        bz[:, h_next_idx, j] = torch.where(
-                            better, torch.tensor(z_vals[j], device=dev, dtype=torch.long),
-                            bz[:, h_next_idx, j])
-                    bh[h_next_idx] = ch_idx
-                else:
-                    # Unresolved root: per-sample y
-                    h_combo = tuple(self.h_states[c][ch_idx[ci]] for ci, c in enumerate(ch)) if ch else ()
-                    for yi, y_val in enumerate(y_batch):
-                        h = decomp.transition_fn(h_combo, z_vals, node, y_val)
-                        if h is not None:
-                            if h not in self.h_to_idx[node]:
-                                self._resolve_root_h(y_val)
-                                if sc.shape[1] < self.H(node):
-                                    new_sc = torch.full((N, self.H(node)), NEG_INF, device=dev)
-                                    new_sc[:, :sc.shape[1]] = sc
-                                    sc = new_sc
-                                    new_bz = torch.zeros(N, self.H(node), max(r,1), dtype=torch.long, device=dev)
-                                    new_bz[:, :bz.shape[1]] = bz
-                                    bz = new_bz
-                            hidx = self.h_to_idx[node][h]
-                            if s[yi] > sc[yi, hidx]:
-                                sc[yi, hidx] = s[yi]
-                                for j in range(r):
-                                    bz[yi, hidx, j] = z_vals[j]
-                                bh[hidx] = ch_idx
+                better = s > sc[:, h_next_idx]
+                sc[:, h_next_idx] = torch.where(better, s, sc[:, h_next_idx])
+                for j in range(r):
+                    bz[:, h_next_idx, j] = torch.where(
+                        better, torch.tensor(z_vals[j], device=dev, dtype=torch.long),
+                        bz[:, h_next_idx, j])
+                bh[h_next_idx] = ch_idx
 
             scores_dict[node] = sc
             bp_z[node] = bz
