@@ -427,27 +427,50 @@ class IFWABLReasoner(Reasoner):
             all_y.append(ex.Y)
             all_n.append(n)
 
-        # Group by (n, y)
+        # Group by n (engine is y-independent)
         groups = defaultdict(list)
-        for i, (n_i, y_i) in enumerate(zip(all_n, all_y)):
-            groups[(n_i, y_i)].append(i)
+        for i, n_i in enumerate(all_n):
+            groups[n_i].append(i)
 
         results = [[] for _ in range(n_examples)]
 
-        for (n_i, y_i), indices in groups.items():
+        for n_i, indices in groups.items():
             decomp = kb._get_decomp(n_i)
 
-            engine_key = (n_i, y_i)
             if not hasattr(kb, '_batch_engine_cache'):
                 kb._batch_engine_cache = {}
-            if engine_key not in kb._batch_engine_cache:
-                kb._batch_engine_cache[engine_key] = BatchDPEngine(
-                    decomp, K, y_i, device='cpu',
+            if n_i not in kb._batch_engine_cache:
+                # Root output fn: reconstruct z from representatives + z_vals,
+                # compute KB output, return h_final(kb_output). No y-check.
+                _kb = kb
+                _d = decomp
+                _reps = getattr(decomp, '_reps', {})
+
+                def _root_output(h_combo, z_vals, node,
+                                 __kb=_kb, __d=_d, __reps=_reps):
+                    ch = __d.children[node]
+                    z = [0] * __d.n
+                    for ci, c in enumerate(ch):
+                        rep = __reps.get((c, h_combo[ci]))
+                        if rep:
+                            for vid, val in rep.items():
+                                z[vid] = val
+                    for j, vid in enumerate(__d.var_groups[node]):
+                        z[vid] = z_vals[j]
+                    labels = [__kb.idx_to_label[z[v]] for v in range(len(z))]
+                    kb_out = __kb.logic_forward(labels)
+                    if kb_out is None:
+                        return None
+                    return ("__target__", kb_out)
+
+                kb._batch_engine_cache[n_i] = BatchDPEngine(
+                    decomp, K, device='cpu', root_output_fn=_root_output,
                 )
-            engine = kb._batch_engine_cache[engine_key]
+            engine = kb._batch_engine_cache[n_i]
 
             log_p_batch = torch.tensor([all_log_p[i] for i in indices], dtype=torch.float32)
-            z_batch, score_batch = engine.batch_map(log_p_batch)
+            y_list = [all_y[i] for i in indices]
+            z_batch, score_batch = engine.batch_map(y_list, log_p_batch)
 
             for gi, idx in enumerate(indices):
                 score = score_batch[gi].item()
@@ -591,34 +614,55 @@ class IFWA3BLReasoner_v2(Reasoner):
             all_y.append(ex.Y)
             all_n.append(n)
 
-        # Group by (n, y) for batching — same decomp structure & engine
-        groups = defaultdict(list)  # (n, y) -> [indices]
-        for i, (n_i, y_i) in enumerate(zip(all_n, all_y)):
-            groups[(n_i, y_i)].append(i)
+        # Group by n for batching (engine is y-independent)
+        groups = defaultdict(list)  # n -> [indices]
+        for i, n_i in enumerate(all_n):
+            groups[n_i].append(i)
 
         # Results storage
         soft_results = [None] * n_examples
         hard_results = [None] * n_examples
         valid_flags = [False] * n_examples
 
-        for (n_i, y_i), indices in groups.items():
+        for n_i, indices in groups.items():
             decomp = kb._get_decomp(n_i)
 
-            # Build or retrieve batch engine for this (n, y)
-            engine_key = (n_i, y_i)
+            # Build or retrieve batch engine (y-independent, keyed by n only)
             if not hasattr(kb, '_batch_engine_cache'):
                 kb._batch_engine_cache = {}
-            if engine_key not in kb._batch_engine_cache:
-                kb._batch_engine_cache[engine_key] = BatchDPEngine(
-                    decomp, K, y_i, device='cpu',
+            if n_i not in kb._batch_engine_cache:
+                # Root output fn: reconstruct z from representatives + z_vals,
+                # compute KB output, return h_final(kb_output). No y-check.
+                _kb = kb
+                _d = decomp
+                _reps = getattr(decomp, '_reps', {})
+
+                def _root_output(h_combo, z_vals, node,
+                                 __kb=_kb, __d=_d, __reps=_reps):
+                    ch = __d.children[node]
+                    z = [0] * __d.n
+                    for ci, c in enumerate(ch):
+                        rep = __reps.get((c, h_combo[ci]))
+                        if rep:
+                            for vid, val in rep.items():
+                                z[vid] = val
+                    for j, vid in enumerate(__d.var_groups[node]):
+                        z[vid] = z_vals[j]
+                    labels = [__kb.idx_to_label[z[v]] for v in range(len(z))]
+                    kb_out = __kb.logic_forward(labels)
+                    if kb_out is None:
+                        return None
+                    return ("__target__", kb_out)
+
+                kb._batch_engine_cache[n_i] = BatchDPEngine(
+                    decomp, K, device='cpu', root_output_fn=_root_output,
                 )
-            engine = kb._batch_engine_cache[engine_key]
+            engine = kb._batch_engine_cache[n_i]
 
-            # Build p_batch tensor
             p_batch = torch.tensor([all_p[i] for i in indices], dtype=torch.float32)
-            # (N_group, n_i, K)
+            y_list = [all_y[i] for i in indices]
 
-            q_batch, Z_batch = engine.batch_marginal(p_batch)
+            q_batch, Z_batch = engine.batch_marginal(y_list, p_batch)
             # q_batch: (N_group, n_i, K), Z_batch: (N_group,)
 
             for gi, idx in enumerate(indices):

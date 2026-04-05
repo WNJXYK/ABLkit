@@ -910,6 +910,8 @@ def _build_decomposition(
         h_final_fn=lambda y: ("__target__", y),
         n=n, H=0,
     )
+    # Expose representatives for BatchDPEngine's root_output_fn
+    decomp._reps = _reps
 
     _css_domain_sizes = [
         len(css_states[node]) for node in range(num_nodes) if node != root
