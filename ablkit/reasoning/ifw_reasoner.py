@@ -15,6 +15,11 @@ import numpy as np
 import torch
 
 
+class _DenseNotAvailable(Exception):
+    """Raised when batch dense DP is not applicable for a given batch."""
+    pass
+
+
 # ================================================================
 #  Perception Health Monitor
 # ================================================================
@@ -158,7 +163,7 @@ class PerceptionMonitor:
 from ..data.structures import ListData
 from ..reasoning import KBBase
 from .reasoner import Reasoner
-from .ifw_dp import Decomposition, dp_map, dp_marginal
+from .ifw_dp import Decomposition, dp_map, dp_marginal, dp_map_revision, dp_marginal_revision
 
 
 # ================================================================
@@ -503,231 +508,6 @@ class IFWABLReasoner(Reasoner):
             self.kb.monitor.end_batch()
 
 
-class IFWA3BLReasoner_v2(Reasoner):
-    """A3BL-compatible Reasoner using IFWKB's revision-aware dp_marginal.
-
-    Computes posterior marginals via dp_marginal with revision-augmented
-    state, matching base A3BL's behavior: marginals are computed only over
-    solutions within the revision budget.
-
-    Returns soft labels (marginal probabilities) and hard labels (argmax).
-    """
-
-    def __init__(self, kb, temperature: float = 1.0, **kwargs):
-        super().__init__(kb, dist_func="confidence", **kwargs)
-        self.temperature = temperature
-        self.K = len(kb.pseudo_label_list)
-        self.class_num = self.K
-        self._n_abduce = 0
-        self._n_valid = 0
-
-    def abduce(self, data_example: ListData) -> Tuple[List[Any], List[Any]]:
-        pred_prob = _normalize_pred_prob(data_example.pred_prob, self.K)
-        pseudo_label = data_example.pred_pseudo_label
-        y = data_example.Y
-        n = len(pred_prob)
-        K = self.K
-        T = self.temperature
-
-        # Temperature-scaled probabilities
-        p = []
-        for i in range(n):
-            row_raw = [max(float(pred_prob[i][k]), 1e-30) for k in range(K)]
-            if T != 1.0:
-                row_pow = [r ** (1.0 / T) for r in row_raw]
-                total = sum(row_pow)
-                row = [r / total for r in row_pow]
-            else:
-                row = row_raw
-            p.append(row)
-
-        kb = self.kb
-        decomp = kb._get_decomp(n)
-
-        if kb._in_warmup:
-            var_domains = None
-        else:
-            var_domains = _compute_var_domains(
-                p, n, K, 0, kb.perception_threshold,
-            )
-
-        # Build revision-aware decomposition (cached, per-sample state via kb._rev_*)
-        pseudo_idx = [kb.label_to_idx.get(lbl, 0) for lbl in pseudo_label]
-        symbol_num = n
-        max_revision_num = self._get_max_revision_num(self.max_revision, symbol_num)
-        kb._rev_pseudo_idx = pseudo_idx
-        kb._rev_max = max_revision_num
-        cache_key = n
-        if cache_key not in kb._rev_decomp_cache:
-            kb._rev_decomp_cache[cache_key] = kb._build_revision_decomp(decomp)
-        rev_decomp, h_accept = kb._rev_decomp_cache[cache_key]
-        rev_decomp.h_final_fn(y)
-
-        q, Z = dp_marginal(
-            rev_decomp, K, y, p,
-            var_domains=var_domains,
-            max_states=kb.max_states,
-            h_final_accept=h_accept,
-        )
-
-        self._n_abduce += 1
-        valid = Z > 0
-        if valid:
-            self._n_valid += 1
-
-        kb.monitor.record_abduce(var_domains, pred_prob, n, K, valid)
-
-        if not valid:
-            return [], []
-
-        soft_labels = [torch.tensor(q[i], dtype=torch.float32) for i in range(n)]
-        hard_labels = [
-            kb.idx_to_label[max(range(K), key=lambda k: q[i][k])]
-            for i in range(n)
-        ]
-        return soft_labels, hard_labels
-
-    def batch_abduce(self, data_examples: ListData) -> List[List[Any]]:
-        from .ifw_batch import BatchDPEngine
-        from collections import defaultdict
-
-        kb = self.kb
-        K = self.K
-        T = self.temperature
-        n_examples = len(data_examples)
-        if n_examples == 0:
-            data_examples.abduced_soft_label = []
-            data_examples.abduced_pseudo_label = []
-            return []
-
-        # Collect per-example data
-        all_p = []       # list of (n_i, K) probs
-        all_y = []
-        all_n = []
-        for ex in data_examples:
-            pred_prob = _normalize_pred_prob(ex.pred_prob, K)
-            n = len(pred_prob)
-            p = []
-            for i in range(n):
-                row = [max(float(pred_prob[i][k]), 1e-30) for k in range(K)]
-                if T != 1.0:
-                    row = [r ** (1.0 / T) for r in row]
-                    s = sum(row)
-                    row = [r / s for r in row]
-                p.append(row)
-            all_p.append(p)
-            all_y.append(ex.Y)
-            all_n.append(n)
-
-        # Group by n for batching (engine is y-independent)
-        groups = defaultdict(list)  # n -> [indices]
-        for i, n_i in enumerate(all_n):
-            groups[n_i].append(i)
-
-        # Results storage
-        soft_results = [None] * n_examples
-        hard_results = [None] * n_examples
-        valid_flags = [False] * n_examples
-
-        for n_i, indices in groups.items():
-            decomp = kb._get_decomp(n_i)
-
-            # Brute-force decomp (no _reps) → fall back to per-sample
-            if not getattr(decomp, '_reps', None):
-                for idx in indices:
-                    self.kb._pred_prob = data_examples[idx].pred_prob
-                    soft, hard = self.abduce(data_examples[idx])
-                    self.kb._pred_prob = None
-                    soft_results[idx] = soft
-                    hard_results[idx] = hard
-                    valid_flags[idx] = bool(soft)
-                continue
-
-            # Build or retrieve batch engine (y-independent, keyed by n only)
-            if not hasattr(kb, '_batch_engine_cache'):
-                kb._batch_engine_cache = {}
-            if n_i not in kb._batch_engine_cache:
-                _kb = kb
-                _d = decomp
-                _reps = decomp._reps
-
-                def _root_output(h_combo, z_vals, node,
-                                 __kb=_kb, __d=_d, __reps=_reps):
-                    ch = __d.children[node]
-                    z = [0] * __d.n
-                    for ci, c in enumerate(ch):
-                        rep = __reps.get((c, h_combo[ci]))
-                        if rep:
-                            for vid, val in rep.items():
-                                z[vid] = val
-                    for j, vid in enumerate(__d.var_groups[node]):
-                        z[vid] = z_vals[j]
-                    labels = [__kb.idx_to_label[z[v]] for v in range(len(z))]
-                    kb_out = __kb.logic_forward(labels)
-                    if kb_out is None:
-                        return None
-                    return ("__target__", kb_out)
-
-                kb._batch_engine_cache[n_i] = BatchDPEngine(
-                    decomp, K, device='cpu', root_output_fn=_root_output,
-                )
-            engine = kb._batch_engine_cache[n_i]
-
-            p_batch = torch.tensor([all_p[i] for i in indices], dtype=torch.float32)
-            y_list = [all_y[i] for i in indices]
-
-            # Build pseudo_idx_batch for revision tracking
-            pseudo_idx_batch = None
-            max_revision_num = -1
-            if hasattr(self, 'max_revision'):
-                n_i_sym = n_i
-                max_revision_num = self._get_max_revision_num(self.max_revision, n_i_sym)
-                pseudo_idx_batch = torch.tensor(
-                    [[kb.label_to_idx.get(lbl, 0) for lbl in data_examples[i].pred_pseudo_label]
-                     for i in indices],
-                    dtype=torch.long,
-                )
-
-            q_batch, Z_batch = engine.batch_marginal(
-                y_list, p_batch, pseudo_idx_batch, max_revision_num,
-            )
-            # q_batch: (N_group, n_i, K), Z_batch: (N_group,)
-
-            for gi, idx in enumerate(indices):
-                Z = Z_batch[gi].item()
-                self._n_abduce += 1
-                if Z > 0:
-                    self._n_valid += 1
-                    valid_flags[idx] = True
-                    soft = [q_batch[gi, v, :] for v in range(n_i)]
-                    hard = [kb.idx_to_label[q_batch[gi, v, :].argmax().item()] for v in range(n_i)]
-                    soft_results[idx] = soft
-                    hard_results[idx] = hard
-                else:
-                    soft_results[idx] = []
-                    hard_results[idx] = []
-
-                # Monitor
-                pred_prob = _normalize_pred_prob(data_examples[idx].pred_prob, K)
-                n = len(pred_prob)
-                if kb._in_warmup:
-                    vd = None
-                else:
-                    vd = _compute_var_domains(all_p[idx], n, K, 0, kb.perception_threshold)
-                kb.monitor.record_abduce(vd, pred_prob, n, K, valid_flags[idx])
-
-        data_examples.abduced_soft_label = soft_results
-        data_examples.abduced_pseudo_label = hard_results
-        return soft_results
-
-    def end_loop(self):
-        if hasattr(self.kb, 'monitor'):
-            self.kb.monitor.end_batch()
-
-    def __call__(self, data_examples: ListData) -> List[List[Any]]:
-        return self.batch_abduce(data_examples)
-
-
 def _normalize_pred_prob(pred_prob, K: int):
     """
     Normalize pred_prob to a list of K-element distributions.
@@ -759,7 +539,7 @@ def _normalize_pred_prob(pred_prob, K: int):
     return pred_prob
 
 
-def _compute_var_domains(probs, n, K, top_k=0, threshold=0.0):
+def _compute_var_domains(probs, n, K, top_k=0, threshold=0.0, min_domain=1):
     """
     Compute per-variable restricted domains from perception probabilities.
 
@@ -769,7 +549,8 @@ def _compute_var_domains(probs, n, K, top_k=0, threshold=0.0):
         K: Domain size.
         top_k: If > 0, keep only top-k values per variable.
         threshold: If > 0, keep values with prob >= threshold * max_prob.
-                   At least 1 value (argmax) is always kept.
+        min_domain: Minimum number of kept values per variable (default 1).
+                    Set to 2 for marginal DP to allow single-position correction.
 
     Returns:
         List of n lists of kept value indices, or None if no pruning.
@@ -790,9 +571,18 @@ def _compute_var_domains(probs, n, K, top_k=0, threshold=0.0):
                 kept = [max(range(K), key=lambda k: row[k])]
             if top_k > 0 and len(kept) > top_k:
                 kept = sorted(kept, key=lambda k: row[k], reverse=True)[:top_k]
+            # Ensure at least min_domain values are kept
+            if len(kept) < min_domain:
+                ranked = sorted(range(K), key=lambda k: row[k], reverse=True)
+                for k in ranked:
+                    if k not in kept:
+                        kept.append(k)
+                    if len(kept) >= min_domain:
+                        break
             var_domains.append(kept)
         else:
-            top = sorted(range(K), key=lambda k: row[k], reverse=True)[:top_k]
+            top_count = max(top_k, min_domain)
+            top = sorted(range(K), key=lambda k: row[k], reverse=True)[:top_count]
             var_domains.append(top)
     return var_domains
 
@@ -937,9 +727,15 @@ class IFWReasoner(Reasoner):
             for i in range(n)
         ]
 
-        z_hat, score = dp_map(decomp, K, y, log_p,
-                              var_domains=var_domains,
-                              max_states=self.max_states)
+        # Always use revision-aware DP (aligns with ABL's progressive search)
+        max_rev = self._get_max_revision_num(self.max_revision, n)
+        pseudo_label = data_example.pred_pseudo_label
+        pseudo_idx = [self.label_to_idx.get(lbl, 0) for lbl in pseudo_label]
+        z_hat, score = dp_map_revision(
+            decomp, K, y, log_p, pseudo_idx, max_rev,
+            require_more_revision=self.require_more_revision,
+            var_domains=var_domains, max_states=self.max_states,
+        )
 
         self._n_abduce += 1
         valid = score > float("-inf")
@@ -1008,6 +804,7 @@ class IFWA3BLReasoner(Reasoner):
         kb: KBBase,
         K: Optional[int] = None,
         temperature: float = 1.0,
+        topK: int = 16,
         idx_to_label: Optional[dict] = None,
         max_states: int = 0,
         perception_top_k: int = 0,
@@ -1018,21 +815,29 @@ class IFWA3BLReasoner(Reasoner):
         auto_decompose_max_precompute: int = 100_000,
         auto_decompose_lazy_precompute: bool = False,
         monitor: bool = False,
+        max_revision: int = 0,
+        require_more_revision: int = 0,
+        revision_warmup: int = 0,
         **kwargs,
     ):
         super().__init__(kb, dist_func="confidence", idx_to_label=idx_to_label, **kwargs)
         self.K = K if K is not None else len(kb.pseudo_label_list)
         self.class_num = self.K
         self.temperature = temperature
+        self.topK = topK
         self.max_states = max_states
         self.perception_top_k = perception_top_k
         self.perception_threshold = perception_threshold
         self.auto_decompose_num_samples = auto_decompose_num_samples
         self.auto_decompose_max_precompute = auto_decompose_max_precompute
         self.auto_decompose_lazy_precompute = auto_decompose_lazy_precompute
+        self.max_revision = max_revision
+        self.require_more_revision = require_more_revision
+        self.revision_warmup = revision_warmup
         self._decomp_cache = {}
         self._n_abduce = 0
         self._n_valid = 0
+        self._n_loops = 0
         self.monitor = PerceptionMonitor(enabled=monitor)
 
         if auto_decompose_n is not None:
@@ -1086,6 +891,9 @@ class IFWA3BLReasoner(Reasoner):
             )
         else:
             print_log(f"[{self.__class__.__name__}] Auto-decomposed n={n} (fallback)", logger="current")
+        # Store info on decomp for batch DP detection
+        if isinstance(info, dict):
+            decomp._batch_info = info
         self._decomp_cache[n] = decomp
         return decomp
 
@@ -1105,46 +913,54 @@ class IFWA3BLReasoner(Reasoner):
 
         decomp = self._get_decomp(n)
 
+        # Build p for DP: exp(p_raw/T) normalized per variable.
+        # DP multiplies per-variable scores, giving weight ∝ exp(Σ p_raw/T),
+        # matching A3BL's confidence_dist scoring.
         p = []
         for i in range(n):
             row_raw = [max(float(pred_prob[i][k]), 1e-30) for k in range(K)]
-            if T != 1.0:
-                row_pow = [r ** (1.0 / T) for r in row_raw]
-                total = sum(row_pow)
-                row = [r / total for r in row_pow]
-            else:
-                row = row_raw
+            row = [math.exp(r / T) for r in row_raw]
+            total = sum(row)
+            row = [r / total for r in row]
             p.append(row)
 
-        if self._in_warmup:
-            var_domains = None
-        else:
-            var_domains = _compute_var_domains(
-                p, n, K, self.perception_top_k, self.perception_threshold,
-            )
+        pseudo_idx = [max(range(K), key=lambda k, i=i: p[i][k]) for i in range(n)]
 
-        q, Z = dp_marginal(decomp, K, y, p,
-                           var_domains=var_domains,
-                           max_states=self.max_states)
+        # Resolve max_revision: -1 means "allow up to n revisions" (same as A3BLReasoner)
+        effective_max_rev = self._get_max_revision_num(self.max_revision, n)
+
+        # Forward pass: DP marginal gives exact posterior
+        q, Z = dp_marginal_revision(
+            decomp, K, y, p,
+            pseudo_idx=pseudo_idx,
+            max_revision=effective_max_rev,
+            require_more_revision=self.require_more_revision,
+            var_domains=None, max_states=self.max_states,
+        )
 
         self._n_abduce += 1
         valid = Z > 0
         if valid:
             self._n_valid += 1
 
-        self.monitor.record_abduce(var_domains, pred_prob, n, K, valid)
+        self.monitor.record_abduce(None, pred_prob, n, K, valid)
 
         if not valid:
             return [], []
 
+        # Use DP marginal directly as soft label (exact posterior)
         soft_labels = [torch.tensor(q[i], dtype=torch.float32) for i in range(n)]
-        hard_labels = [
-            self.idx_to_label[max(range(K), key=lambda k: q[i][k])]
-            for i in range(n)
-        ]
+        hard_labels = [self.idx_to_label[max(range(K), key=lambda k: q[i][k])] for i in range(n)]
         return soft_labels, hard_labels
 
     def batch_abduce(self, data_examples: ListData) -> List[List[Any]]:
+        # Try batch GPU forward DP + per-sample enumerate+aggregate
+        if len(data_examples) > 0:
+            try:
+                return self._batch_abduce_dense(data_examples)
+            except _DenseNotAvailable:
+                pass
+        # Fallback: sequential per-sample
         results = [self.abduce(ex) for ex in data_examples]
         if not results:
             data_examples.abduced_soft_label = []
@@ -1155,8 +971,114 @@ class IFWA3BLReasoner(Reasoner):
         data_examples.abduced_pseudo_label = list(hard)
         return list(soft)
 
+    def _batch_abduce_dense(self, data_examples: ListData) -> List[List[Any]]:
+        """Batched abduction: GPU batch DP marginal → soft labels."""
+        import time as _time
+        import torch
+        import numpy as np
+        from .ifw_dp_batch import (
+            is_dense_decomp, precompute_batch_tables,
+            batch_dp_marginal_revision,
+        )
+
+        # ── Collect batch data (vectorized) ──
+        ys = []
+        pp_arrays = []
+        ns = set()
+        for ex in data_examples:
+            pp = _normalize_pred_prob(ex.pred_prob, self.K)
+            pp_arrays.append(np.asarray(pp, dtype=np.float64))
+            ys.append(ex.Y)
+            ns.add(len(pp))
+
+        if len(ns) != 1:
+            raise _DenseNotAvailable  # mixed n in batch
+
+        n = ns.pop()
+        K = self.K
+        T = self.temperature
+
+        decomp = self._get_decomp(n)
+        if not is_dense_decomp(decomp):
+            raise _DenseNotAvailable
+
+        B = len(pp_arrays)
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+        # ── Build p_batch [B, n, K] via vectorized exp(raw/T) ──
+        raw = np.stack(pp_arrays, axis=0)  # [B, n, K]
+        np.clip(raw, 1e-30, None, out=raw)
+        raw_t = torch.from_numpy(raw).to(device=device, dtype=torch.float64)
+        p_batch = torch.exp(raw_t / T)
+        p_batch /= p_batch.sum(dim=2, keepdim=True)
+        pseudo_idx_batch = p_batch.argmax(dim=2).long()  # [B, n]
+
+        # ── Precompute transitions (cached) ──
+        unique_ys = sorted(set(ys))
+        cache_key = (id(decomp), tuple(unique_ys))
+        if not hasattr(self, '_bd_cache'):
+            self._bd_cache = {}
+        if cache_key not in self._bd_cache:
+            self._bd_cache[cache_key] = precompute_batch_tables(decomp, K, unique_ys)
+        bd = self._bd_cache[cache_key]
+
+        # ── Batch DP ──
+        # Resolve max_revision: -1 means "allow up to n revisions"
+        effective_max_rev = self._get_max_revision_num(self.max_revision, n)
+        _t0 = _time.time()
+        q_batch, Z_batch = batch_dp_marginal_revision(
+            bd, K, ys, p_batch, pseudo_idx_batch,
+            max_revision=effective_max_rev,
+            require_more_revision=self.require_more_revision,
+            return_alpha=False,
+        )
+        _t1 = _time.time()
+
+        # ── Unpack results (vectorized) ──
+        Z_cpu = Z_batch.cpu()
+        q_cpu = q_batch.cpu().float()  # [B, n, K]
+        valid_mask = Z_cpu > 0  # [B]
+
+        self._n_abduce += B
+        n_valid = int(valid_mask.sum().item())
+        self._n_valid += n_valid
+
+        hard_idx = q_cpu.argmax(dim=2)  # [B, n]
+
+        all_soft = []
+        all_hard = []
+        for bi in range(B):
+            if not valid_mask[bi]:
+                all_soft.append([])
+                all_hard.append([])
+            else:
+                all_soft.append([q_cpu[bi, i] for i in range(n)])
+                all_hard.append([self.idx_to_label[z] for z in hard_idx[bi].tolist()])
+
+        _t2 = _time.time()
+        from ..utils import print_log
+        print_log(
+            f"[batch_abd] B={B} n={n} dp={_t1-_t0:.3f}s total={_t2-_t0:.3f}s "
+            f"valid={n_valid}/{B}",
+            logger="current",
+        )
+
+        data_examples.abduced_soft_label = all_soft
+        data_examples.abduced_pseudo_label = all_hard
+        return all_soft
+
     def end_loop(self):
         """Commit accumulated per-example stats as one history entry (call after each ABL loop)."""
+        self._n_loops += 1
+        if (self.max_revision > 0 and self.revision_warmup > 0
+                and self._n_loops == self.revision_warmup):
+            from ..utils import print_log
+            print_log(
+                f"[IFWA3BLReasoner] Warmup done (loop {self._n_loops}), "
+                f"switching to dp_marginal_revision (max_rev={self.max_revision}, "
+                f"rmr={self.require_more_revision})",
+                logger="current",
+            )
         self.monitor.end_batch()
 
     def __call__(self, data_examples: ListData) -> List[List[Any]]:

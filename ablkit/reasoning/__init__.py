@@ -3,7 +3,7 @@ from .reasoner import Reasoner
 from .a3bl_reasoner import A3BLReasoner, confidence_dist
 from .cached_kb import CachedKB
 
-from .ifw_reasoner import IFWReasoner, IFWA3BLReasoner, IFWKB, IFWABLReasoner, IFWA3BLReasoner_v2
+from .ifw_reasoner import IFWReasoner, IFWA3BLReasoner, IFWKB, IFWABLReasoner
 
 # Core DP infrastructure (generic, unified tree/chain)
 from .ifw_dp import (
